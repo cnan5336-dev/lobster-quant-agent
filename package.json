@@ -1,0 +1,52 @@
+{
+  "name": "openclaw-plugin-lobster-quant-agent",
+  "version": "0.1.0",
+  "description": "OpenClaw trading-research and alert plugin for A-share and US-market workflows.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
+    "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
+    "plugin:check": "npm run build && openclaw plugins build --entry ./dist/index.js --check",
+    "plugin:validate": "npm run build && openclaw plugins validate --entry ./dist/index.js",
+    "test": "vitest run --config ./vitest.config.ts",
+    "test:python": ".venv/bin/python -m unittest discover -s python -p 'test_*.py'",
+    "audit:privacy": "python3 scripts/privacy_audit.py ."
+  },
+  "files": [
+    "dist",
+    "python",
+    "scripts",
+    "config/lobster-quant-agent.example.json",
+    "openclaw.plugin.json",
+    "README.md",
+    "INSTALL_WITH_AGENT.md",
+    "SECURITY.md",
+    "DISCLAIMER.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.22.3"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.17"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "typebox": "^1.1.38"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

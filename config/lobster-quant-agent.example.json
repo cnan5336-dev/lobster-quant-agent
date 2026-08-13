@@ -1,0 +1,8 @@
+{
+  "defaultChannel": "telegram",
+  "primaryModel": "",
+  "fallbackModels": [],
+  "notifyChannels": [],
+  "notificationTargets": {},
+  "timeoutSeconds": 120
+}

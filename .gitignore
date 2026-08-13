@@ -1,0 +1,54 @@
+# Dependencies and build output
+node_modules/
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config/*local*
+config/*private*
+config/*secret*
+credentials*.json
+secrets*.json
+*token*
+*.pem
+*.key
+*.p12
+*.pickle
+
+# OpenClaw runtime and personal state
+.openclaw/
+memory/
+logs/
+cache/
+backtests/
+results/
+reports/
+screenshots/private/
+*.log
+*.pid
+*.lock
+*.session*
+*pairing*
+*device*
+market_watchlist.json
+market_monitor_state.json
+backtest_config.json
+
+# Backups and editor/OS files
+*.bak
+*.backup
+*.orig
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,136 @@
+{
+  "id": "lobster-quant-agent",
+  "name": "Lobster Quant Agent",
+  "description": "OpenClaw research and alert tools for A-share and US-market workflows. No broker access or order execution.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "pythonExecutable": {
+        "type": "string",
+        "description": "Python executable from the repository virtual environment."
+      },
+      "stateDirectory": {
+        "type": "string",
+        "description": "Private local state directory. Never point this at the repository."
+      },
+      "defaultChannel": {
+        "anyOf": [
+          {
+            "type": "string",
+            "const": "weixin"
+          },
+          {
+            "type": "string",
+            "const": "telegram"
+          },
+          {
+            "type": "string",
+            "const": "qq"
+          }
+        ]
+      },
+      "primaryModel": {
+        "type": "string",
+        "description": "OpenClaw model key used first for model-assisted tasks."
+      },
+      "fallbackModels": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 2
+      },
+      "notifyChannels": {
+        "type": "array",
+        "items": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "weixin"
+            },
+            {
+              "type": "string",
+              "const": "telegram"
+            },
+            {
+              "type": "string",
+              "const": "qq"
+            }
+          ]
+        },
+        "uniqueItems": true
+      },
+      "notificationTargets": {
+        "type": "object",
+        "properties": {
+          "weixin": {
+            "type": "object",
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "type": "string",
+                "description": "Destination understood by the installed OpenClaw channel."
+              },
+              "account": {
+                "type": "string",
+                "description": "Optional OpenClaw channel account id."
+              }
+            },
+            "additionalProperties": false
+          },
+          "telegram": {
+            "type": "object",
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "type": "string",
+                "description": "Destination understood by the installed OpenClaw channel."
+              },
+              "account": {
+                "type": "string",
+                "description": "Optional OpenClaw channel account id."
+              }
+            },
+            "additionalProperties": false
+          },
+          "qq": {
+            "type": "object",
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "type": "string",
+                "description": "Destination understood by the installed OpenClaw channel."
+              },
+              "account": {
+                "type": "string",
+                "description": "Optional OpenClaw channel account id."
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "timeoutSeconds": {
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 600
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "lobster_quant"
+    ]
+  }
+}
