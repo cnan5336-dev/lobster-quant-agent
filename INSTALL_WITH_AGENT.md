@@ -45,10 +45,19 @@ Deploy this checkout as the `lobster-quant-agent` plugin in **my existing OpenCl
    ./scripts/validate.sh
    ```
 
-5. Ask the user which OpenClaw channel they want: Telegram, WeChat (`openclaw-weixin`), or QQ (`qqbot`). If it is not configured, direct the user to complete OpenClaw's interactive channel setup themselves. Never invent or recover credentials and never paste them into this repository.
-6. Ask whether the user wants model-assisted fallback. If yes, list available OpenClaw model keys with a read-only command and let the user choose a primary and up to two fallbacks. Model keys are not API keys. Do not alter global model/provider credentials.
-7. Keep proactive notifications disabled by default. Only after explicit user approval, configure `notifyChannels` and a destination under `notificationTargets` in the user's local OpenClaw plugin config. Treat channel targets and account IDs as private. Do not send a test during installation unless the user separately asks for a real external send after reviewing the target.
-8. Rerun `openclaw config validate`. Report exactly what was installed, which optional items remain unconfigured, and confirm that no message was sent and no monitor was started.
+5. Run the dependency-free, no-network first-use path before asking for any channel choice:
+
+   ```bash
+   python3 python/lobster_quant_agent/cli.py demo
+   python3 scripts/first_use_smoke.py
+   ```
+
+   Confirm that the demo says `synthetic_offline`, the smoke test reports zero network requests/messages/broker actions, and the missing-target check passes. These outputs are synthetic test evidence, not market performance.
+
+6. Ask the user which OpenClaw channel they want: Telegram, WeChat (`openclaw-weixin`), or QQ (`qqbot`). If it is not configured, direct the user to complete OpenClaw's interactive channel setup themselves. Never invent or recover credentials and never paste them into this repository.
+7. Ask whether the user wants model-assisted fallback. If yes, list available OpenClaw model keys with a read-only command and let the user choose a primary and up to two fallbacks. Model keys are not API keys. Do not alter global model/provider credentials.
+8. Keep proactive notifications disabled by default. Only after explicit user approval, configure `notifyChannels` and a destination under `notificationTargets` in the user's local OpenClaw plugin config. Treat channel targets and account IDs as private. Do not send a test during installation unless the user separately asks for a real external send after reviewing the target.
+9. Rerun `openclaw config validate`. Report exactly what was installed, which optional items remain unconfigured, and confirm that no message was sent and no monitor was started.
 
 ## Local configuration shape
 
@@ -64,3 +73,17 @@ Optional user-selected values are `primaryModel`, `fallbackModels`, the default 
 ## Safe validation definition
 
 Validation may build code, run unit tests, parse a strategy in dry-run mode, inspect plugin metadata, and validate OpenClaw configuration. It may not execute `monitor on`, `monitor start`, `notify-test`, `simulate-alert`, `openclaw message send`, a model ping, or any broker/order action.
+
+## Uninstall and cleanup
+
+First inspect what OpenClaw would remove:
+
+```bash
+openclaw plugins uninstall lobster-quant-agent --dry-run
+```
+
+Only after the user confirms, uninstall the plugin with `openclaw plugins uninstall lobster-quant-agent`. Do not delete the checkout, local configuration, or configured private state directory unless the user separately identifies and approves each exact path. Uninstall does not authorize deleting watchlists, holdings labels, caches, or backtest results.
+
+If OpenClaw rejects the write with `Config write rejected` or `size-drop`, stop. Do not bypass the guard or force-edit the configuration. Preserve the rejected artifact locally, run `openclaw config validate` and `openclaw doctor`, then follow the current OpenClaw troubleshooting guidance or ask the user how to proceed.
+
+The ClawHub command documented in README is future-facing until the package is actually published and its scan clears. During candidate review, do not attempt to resolve or install the nonexistent ClawHub listing.

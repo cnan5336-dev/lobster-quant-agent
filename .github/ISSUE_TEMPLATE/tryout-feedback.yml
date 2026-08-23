@@ -1,0 +1,72 @@
+name: First-use feedback
+description: Share a privacy-safe fresh-install result so setup friction can be improved.
+title: "[First use]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing. Report only synthetic or redacted evidence. This form measures technical first use; it is not a testimonial and does not ask for account, portfolio, or channel details.
+  - type: input
+    id: version
+    attributes:
+      label: Tested version or commit
+      placeholder: "0.2.0-rc.1 or a full commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS/architecture and OpenClaw, Node.js, Python versions; omit usernames and absolute paths.
+    validations:
+      required: true
+  - type: dropdown
+    id: experience
+    attributes:
+      label: OpenClaw experience before this test
+      options:
+        - First week
+        - Some prior use
+        - Regular user
+        - Plugin developer/maintainer
+    validations:
+      required: true
+  - type: checkboxes
+    id: milestones
+    attributes:
+      label: Completed milestones
+      options:
+        - label: Read the safety and compatibility boundaries
+        - label: Installed dependencies or the candidate package in a fresh environment
+        - label: Enabled the plugin and passed runtime inspect
+        - label: Ran the offline synthetic demo
+        - label: Ran the offline first-use smoke test
+        - label: Confirmed a missing notification target fails closed
+        - label: Reviewed uninstall/cleanup instructions
+  - type: input
+    id: time_to_demo
+    attributes:
+      label: Approximate minutes to first successful synthetic demo
+      placeholder: "Use 'not completed' if it did not work"
+    validations:
+      required: true
+  - type: textarea
+    id: first_blocker
+    attributes:
+      label: First confusing or blocking point
+      description: Quote the command or public documentation text, but redact local paths and identities.
+    validations:
+      required: true
+  - type: textarea
+    id: improvement
+    attributes:
+      label: One improvement that would most help the next new user
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I used synthetic/redacted inputs and included no credential, identity, target, holding, watchlist, private path, log, screenshot, or real generated result.
+          required: true

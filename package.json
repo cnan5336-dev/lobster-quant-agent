@@ -1,17 +1,43 @@
 {
-  "name": "openclaw-plugin-lobster-quant-agent",
-  "version": "0.1.0",
-  "description": "OpenClaw trading-research and alert plugin for A-share and US-market workflows.",
+  "name": "@cnan5336-dev/lobster-quant-agent",
+  "version": "0.2.0-rc.1",
+  "description": "OpenClaw-only A-share and US-market research, alerts, and backtesting without broker access or order execution.",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "author": "cnan5336-dev",
+  "homepage": "https://github.com/cnan5336-dev/lobster-quant-agent#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cnan5336-dev/lobster-quant-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cnan5336-dev/lobster-quant-agent/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "clawhub",
+    "a-shares",
+    "market-research",
+    "alerts",
+    "backtesting"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
-    "plugin:build": "npm run build && openclaw plugins build --entry ./dist/index.js",
-    "plugin:check": "npm run build && openclaw plugins build --entry ./dist/index.js --check",
-    "plugin:validate": "npm run build && openclaw plugins validate --entry ./dist/index.js",
+    "plugin:build": "npm run build && node scripts/run-openclaw-isolated.mjs plugins build --entry ./dist/index.js",
+    "plugin:check": "npm run build && node scripts/run-openclaw-isolated.mjs plugins build --entry ./dist/index.js --check",
+    "plugin:validate": "npm run build && node scripts/run-openclaw-isolated.mjs plugins validate --entry ./dist/index.js",
     "test": "vitest run --config ./vitest.config.ts",
     "test:python": ".venv/bin/python -m unittest discover -s python -p 'test_*.py'",
-    "audit:privacy": "python3 scripts/privacy_audit.py ."
+    "audit:privacy": "python3 scripts/privacy_audit.py .",
+    "demo:generate": "python3 scripts/generate_synthetic_demo.py",
+    "demo:check": "python3 scripts/generate_synthetic_demo.py --check",
+    "pack:check": "node scripts/check-package.mjs",
+    "release:check": "npm run plugin:check && npm run demo:check && npm run pack:check && npm run audit:privacy",
+    "clawhub:validate": "clawhub package validate .",
+    "clawhub:dry-run": "clawhub package publish . --family code-plugin --tags rc --changelog \"ClawHub packaging, bilingual docs, synthetic demo, and privacy-safe first-use checks.\" --dry-run"
   },
   "files": [
     "dist",
@@ -20,9 +46,13 @@
     "config/lobster-quant-agent.example.json",
     "openclaw.plugin.json",
     "README.md",
+    "CHANGELOG.md",
+    "COMPATIBILITY.md",
     "INSTALL_WITH_AGENT.md",
+    "MAINTAINERS.md",
     "SECURITY.md",
     "DISCLAIMER.md",
+    "docs/demo",
     "LICENSE"
   ],
   "engines": {
@@ -47,6 +77,17 @@
   "openclaw": {
     "extensions": [
       "./dist/index.js"
-    ]
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.17"
+    },
+    "build": {
+      "openclawVersion": "2026.7.1",
+      "pluginSdkVersion": "2026.7.1"
+    },
+    "install": {
+      "clawhubSpec": "@cnan5336-dev/lobster-quant-agent",
+      "minHostVersion": ">=2026.5.17"
+    }
   }
 }

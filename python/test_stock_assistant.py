@@ -9,6 +9,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent / "lobster_quant_agent"
 sys.path.insert(0, str(PACKAGE_DIR))
 
 import cli as stock
+import http_client
 from report_pipeline import (
     SCHEMA_VERSION,
     build_after_close_analysis,
@@ -193,11 +194,29 @@ class ReportPipelineTests(unittest.TestCase):
         self.assertEqual(result["代码"], "AAPL")
         self.assertEqual(result["涨跌幅%"], 0.75)
 
+    def test_synthetic_demo_is_offline_and_fail_closed(self):
+        result = stock.synthetic_demo()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "synthetic_offline")
+        self.assertTrue(result["alert"]["fail_closed"])
+
     def test_notifications_fail_closed_without_local_target(self):
         with mock.patch.dict("os.environ", {"LOBSTER_QUANT_NOTIFY_TARGETS": "{}"}, clear=False):
             result = stock.send_openclaw_message("telegram", "synthetic test")
         self.assertFalse(result["ok"])
         self.assertTrue(result["skipped"])
+
+
+class PackagedHttpClientTests(unittest.TestCase):
+    def test_response_decodes_json_without_requests_dependency(self):
+        response = http_client.Response(b'{"ok": true}', 200)
+        self.assertEqual(response.json(), {"ok": True})
+        response.raise_for_status()
+
+    def test_http_error_is_raised_only_after_status_check(self):
+        response = http_client.Response(b"unavailable", 503)
+        with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+            response.raise_for_status()
 
 
 if __name__ == "__main__":

@@ -6,7 +6,10 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-import requests
+try:
+    from .. import http_client as requests
+except ImportError:  # Direct CLI execution adds lobster_quant_agent/ to sys.path.
+    import http_client as requests
 
 
 STATE_DIR = os.path.abspath(os.path.expanduser(

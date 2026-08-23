@@ -1,0 +1,19 @@
+# Generated Python and test artifacts must never enter the ClawHub/npm payload.
+**/__pycache__/
+**/*.py[cod]
+python/test_*.py
+
+# Local dependencies, configuration, state, and validation output.
+node_modules/
+.venv/
+.env
+.env.*
+config/*local*
+config/*private*
+config/*secret*
+reports/
+results/
+backtests/
+logs/
+cache/
+screenshots/private/

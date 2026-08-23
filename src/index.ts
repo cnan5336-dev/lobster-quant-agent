@@ -86,6 +86,7 @@ export default defineToolPlugin({
           Type.Literal("strategy"),
           Type.Literal("backtest"),
           Type.Literal("model"),
+          Type.Literal("demo"),
         ]),
         arguments: Type.Optional(Type.Array(Type.String(), { maxItems: 40 })),
         channel: Type.Optional(Type.Union([

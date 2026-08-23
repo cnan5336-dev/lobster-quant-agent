@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a reproducible plugin, install, data-labeling, or documentation problem without private data.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping. Use synthetic or redacted inputs only. Never paste credentials, channel/account ids, notification targets, holdings, watchlists, local paths, logs with identity data, or real generated results.
+  - type: input
+    id: version
+    attributes:
+      label: Lobster Quant Agent version or commit
+      placeholder: "0.2.0-rc.1 or a full commit SHA"
+    validations:
+      required: true
+  - type: dropdown
+    id: install_source
+    attributes:
+      label: Install source
+      options:
+        - Source checkout
+        - Local npm-pack candidate
+        - ClawHub package
+        - Other reviewed source
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS/architecture, OpenClaw, Node.js, and Python versions. Do not include usernames or absolute paths.
+      placeholder: "macOS arm64; OpenClaw 2026.x; Node 22.x; Python 3.10"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use the synthetic demo or invented symbols/values where possible.
+      placeholder: |
+        1. Run ...
+        2. Ask ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and redacted error
+      description: Paste only the minimum error text after removing identities, targets, tokens, holdings, state, cache/log paths, and generated results.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy and scope confirmation
+      options:
+        - label: I removed credentials, account/chat ids, notification targets, holdings, watchlists, private paths, logs, screenshots, and real generated results.
+          required: true
+        - label: This report does not request broker integration or order execution.
+          required: true
+        - label: I understand public market data and backtests may be delayed, incomplete, or simplified.
+          required: true

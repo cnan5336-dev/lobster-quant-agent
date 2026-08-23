@@ -11,8 +11,9 @@ import re
 import hashlib
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 
-import requests
+import http_client as requests
 
 from report_pipeline import render_report
 
@@ -29,6 +30,32 @@ HEADERS = {
 STATE_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("LOBSTER_QUANT_HOME", "~/.openclaw/lobster-quant-agent")
 ))
+DEMO_DATA_PATH = Path(__file__).resolve().parents[2] / "docs" / "demo" / "synthetic-market-data.json"
+
+
+def synthetic_demo():
+    """Return a no-network, no-write preview built only from committed synthetic data."""
+    data = json.loads(DEMO_DATA_PATH.read_text(encoding="utf-8"))
+    return {
+        "ok": True,
+        "mode": "synthetic_offline",
+        "provenance": data["provenance"],
+        "research": {
+            "a_share": data["a_share"],
+            "us_market": data["us_market"],
+        },
+        "alert": {
+            **data["alert"],
+            "delivery": "skipped",
+            "fail_closed": True,
+        },
+        "backtest": data["backtest"],
+        "boundaries": [
+            "OpenClaw is the only supported runtime.",
+            "Research and alerts only.",
+            "No broker connection or order execution.",
+        ],
+    }
 
 
 def _state_path(*parts):
@@ -1855,8 +1882,6 @@ def lhb(date=None, symbol=None, emit=True):
     - 指定个股：查最近龙虎榜记录
     - 未指定个股：查指定日期或最近交易日龙虎榜概览
     """
-    import akshare as ak
-
     today = datetime.now().strftime("%Y%m%d")
 
     if symbol:
@@ -1864,6 +1889,17 @@ def lhb(date=None, symbol=None, emit=True):
 
     if symbol and _is_index_or_etf(symbol):
         result = {"error": "不适用（指数/ETF无龙虎榜）"}
+        if emit:
+            print_json(result)
+        return result
+
+    try:
+        import akshare as ak
+    except ImportError:
+        result = {
+            "error": "暂缺（当前安装未启用 AkShare 扩展数据源）",
+            "details": "从源码运行 ./scripts/install.sh 可安装该可选数据源。",
+        }
         if emit:
             print_json(result)
         return result
@@ -2022,7 +2058,7 @@ def _load_news_stock_map():
 
 
 def _fetch_json_or_text(url, timeout=10, headers=None):
-    import requests as _requests
+    import http_client as _requests
     try:
         r = _requests.get(url, timeout=timeout, headers=headers or HEADERS)
         r.raise_for_status()
@@ -6129,11 +6165,14 @@ def main():
         print("python3 a_stock_query.py lhb 510050")
         print("python3 a_stock_query.py morning_report")
         print("python3 a_stock_query.py after_close_report")
+        print("python3 a_stock_query.py demo")
         return
 
     cmd = sys.argv[1]
     try:
-        if cmd in {"nl", "自然语言"}:
+        if cmd in {"demo", "synthetic-demo", "合成演示"}:
+            print_json(synthetic_demo())
+        elif cmd in {"nl", "自然语言"}:
             text = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
             result = handle_natural_language_command(text)
             if isinstance(result, dict) and result.get("_output_format") == "text":

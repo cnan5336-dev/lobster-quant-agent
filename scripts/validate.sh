@@ -22,6 +22,7 @@ fi
 
 "$python_command" -m compileall -q python/lobster_quant_agent python/test_stock_assistant.py
 "$python_command" -m unittest discover -s python -p 'test_*.py'
+"$python_command" scripts/first_use_smoke.py
 
 validation_state="$(mktemp -d)"
 cleanup() {
@@ -38,6 +39,8 @@ LOBSTER_QUANT_HOME="$validation_state" \
 npm run plugin:validate
 npm test
 npm audit --omit=peer
+npm run demo:check
+npm run pack:check
 python3 scripts/privacy_audit.py .
 
 echo "Validation passed. No messages were sent and no monitor was started."

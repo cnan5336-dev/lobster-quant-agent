@@ -1,0 +1,26 @@
+{
+  "provenance": "Purpose-built fictional values for documentation. Not sampled from a user, account, portfolio, chat, alert target, or live market feed.",
+  "a_share": {
+    "symbol": "CN-DEMO",
+    "price": "12.34",
+    "move": "+1.8%",
+    "note": "公开数据适配器的界面示意"
+  },
+  "us_market": {
+    "symbol": "US-DEMO",
+    "price": "42.10",
+    "move": "-0.6%"
+  },
+  "alert": {
+    "signal": "1-minute MACD crossover",
+    "reason": "No explicit notification target was configured (fail closed)."
+  },
+  "backtest": {
+    "strategy": "Close above 20-day average · synthetic series",
+    "sessions": 60,
+    "trades": 4,
+    "return": "+6.4%",
+    "drawdown": "-3.2%",
+    "equity_curve": [100.0, 100.8, 100.4, 101.6, 102.1, 101.8, 103.0, 104.2, 103.5, 105.1, 104.8, 106.4]
+  }
+}
