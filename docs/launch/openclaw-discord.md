@@ -4,7 +4,7 @@ Posting gate: confirm the current showcase/plugin-development channel and its ru
 
 Draft:
 
-> 🦞 **Lobster Quant Agent — OpenClaw market-research plugin (release candidate)**
+> 🦞 **Lobster Quant Agent — OpenClaw market-research plugin (stable 0.2.0)**
 >
 > I built an OpenClaw-only tool for A-share research, delayed US-market snapshots, morning/post-market reports, local alerts, natural-language strategy monitoring, and simplified backtests.
 >

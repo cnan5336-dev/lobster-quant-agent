@@ -2,7 +2,7 @@
   "id": "lobster-quant-agent",
   "name": "Lobster Quant Agent",
   "description": "OpenClaw research and alert tools for A-share and US-market workflows. No broker access or order execution.",
-  "version": "0.2.0-rc.2",
+  "version": "0.2.0",
   "configSchema": {
     "type": "object",
     "properties": {

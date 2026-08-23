@@ -14,7 +14,7 @@
 >
 > ## 1. 插件包最小契约
 >
-> 候选包同时提供 `package.json`、`openclaw.plugin.json` 和构建后的 `dist/index.js`。`package.json` 分开声明插件版本、Plugin API 下限、构建时 OpenClaw/SDK 版本以及未来的 ClawHub 安装来源；`openclaw.plugin.json` 只保存加载代码前必须知道的工具和配置 Schema。
+> 发布包同时提供 `package.json`、`openclaw.plugin.json` 和构建后的 `dist/index.js`。`package.json` 分开声明插件版本、Plugin API 下限、构建时 OpenClaw/SDK 版本以及 ClawHub 安装来源；`openclaw.plugin.json` 只保存加载代码前必须知道的工具和配置 Schema。
 >
 > ```bash
 > npm run plugin:check
@@ -27,7 +27,7 @@
 >
 > ## 2. 为什么不使用 postinstall 自动跑 pip
 >
-> OpenClaw 托管插件安装会忽略生命周期脚本，这是安全边界。候选包因此用 Python 标准库完成普通 JSON/text HTTP 请求，避免“插件安装成功，但第一次调用因为缺 requests 失败”。AkShare 保留为源码安装的增强适配器；缺少时返回清楚的“暂缺”。
+> OpenClaw 托管插件安装会忽略生命周期脚本，这是安全边界。发布包因此用 Python 标准库完成普通 JSON/text HTTP 请求，避免“插件安装成功，但第一次调用因为缺 requests 失败”。AkShare 保留为源码安装的增强适配器；缺少时返回清楚的“暂缺”。
 >
 > ## 3. 合成演示如何避免隐私泄露
 >

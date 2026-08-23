@@ -35,9 +35,15 @@ Lobster Quant Agent 将行情查询、报告、条件提醒、自然语言策略
 
 ## 安装
 
-候选版本要求：macOS 或 Linux、OpenClaw `>=2026.5.17`、Node.js `>=22.22.3`、Python `>=3.10`、npm 和 Git。详见 [兼容性说明](COMPATIBILITY.md)。
+稳定版 `0.2.0` 要求 macOS 或 Linux、OpenClaw `>=2026.5.17`、Node.js `>=22.22.3`、Python `>=3.10`。源码安装还需要 npm 和 Git。详见 [兼容性说明](COMPATIBILITY.md)。
 
-当前候选尚未发布到 ClawHub。审阅期间请从源码安装：
+推荐从 ClawHub 安装稳定版：
+
+```bash
+openclaw plugins install clawhub:@cnan5336-dev/lobster-quant-agent
+```
+
+也可以从公开源码安装：
 
 ```bash
 git clone https://github.com/cnan5336-dev/lobster-quant-agent.git
@@ -45,13 +51,7 @@ cd lobster-quant-agent
 ./scripts/install.sh
 ```
 
-ClawHub 发布并经安全扫描通过后，计划使用：
-
-```bash
-openclaw plugins install clawhub:@cnan5336-dev/lobster-quant-agent
-```
-
-如先公开 `0.2.0-rc.2` 供候选测试，应使用精确版本或 `@rc`，不要把候选版标成稳定 `latest`。
+需要复现候选版时应显式选择对应的 rc 版本；默认安装入口跟随稳定 `latest`。
 
 安装脚本对同一 checkout 可重复执行。它会创建仓库内的 Python 虚拟环境、安装依赖、验证并链接插件、生成被 Git 忽略的本地配置副本，并只向 OpenClaw 写入非敏感的插件路径与安全默认值。它不会发送消息、启动监控、配置凭据或执行交易。
 
@@ -113,9 +113,15 @@ Lobster Quant Agent puts quote lookup, research reports, conditional alerts, nat
 
 ## Install
 
-Release-candidate requirements are macOS or Linux, OpenClaw `>=2026.5.17`, Node.js `>=22.22.3`, Python `>=3.10`, npm, and Git. See [COMPATIBILITY.md](COMPATIBILITY.md).
+Stable release `0.2.0` requires macOS or Linux, OpenClaw `>=2026.5.17`, Node.js `>=22.22.3`, and Python `>=3.10`. Source installation also requires npm and Git. See [COMPATIBILITY.md](COMPATIBILITY.md).
 
-This candidate is not published to ClawHub yet. During review, install from source:
+Install the stable release from ClawHub:
+
+```bash
+openclaw plugins install clawhub:@cnan5336-dev/lobster-quant-agent
+```
+
+You can also install from the public source repository:
 
 ```bash
 git clone https://github.com/cnan5336-dev/lobster-quant-agent.git
@@ -123,13 +129,7 @@ cd lobster-quant-agent
 ./scripts/install.sh
 ```
 
-After a maintainer publishes the reviewed package and ClawHub security checks pass, the planned install command is:
-
-```bash
-openclaw plugins install clawhub:@cnan5336-dev/lobster-quant-agent
-```
-
-If `0.2.0-rc.2` is published for candidate testing first, use the exact version or the `@rc` tag; do not present the candidate as stable `latest`.
+To reproduce a release candidate, select that rc version explicitly; the default installation entry follows stable `latest`.
 
 The installer is idempotent for the same checkout. It creates a repository-local Python virtual environment, installs dependencies, validates and links the plugin, creates an ignored local configuration copy, and writes only non-secret plugin paths and safe defaults to OpenClaw. It does not send a message, start monitoring, configure credentials, or perform a trade.
 
@@ -174,7 +174,7 @@ python3 -m venv .venv
 
 The suite compiles Python, runs deterministic unit tests, exercises strategy parsing in a temporary no-write state directory, validates generated OpenClaw metadata, runs TypeScript tests, checks dependency vulnerabilities, verifies the synthetic demo and npm package payload, and performs a repository privacy audit.
 
-Maintainers should also follow [MAINTAINERS.md](MAINTAINERS.md) and the [local ClawHub release procedure](docs/CLAWHUB_RELEASE.md). Release notes for the current candidate are in [CHANGELOG.md](CHANGELOG.md).
+Maintainers should also follow [MAINTAINERS.md](MAINTAINERS.md) and the [local ClawHub release procedure](docs/CLAWHUB_RELEASE.md). See the [0.2.0 release notes](docs/releases/0.2.0.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## 安全与隐私 / Safety & privacy
 
@@ -183,7 +183,7 @@ Maintainers should also follow [MAINTAINERS.md](MAINTAINERS.md) and the [local C
 - Minute history can be shorter than requested. Cache fallback is labeled and may be stale.
 - Backtests are simplified simulations; they do not fully model liquidity, price limits, corporate actions, or real execution.
 - Monitoring is local and opt-in. Notification delivery fails closed when a channel target is missing.
-- The monitor uses POSIX file locks, so Windows is not supported in this release candidate.
+- The monitor uses POSIX file locks, so Windows is not supported in this release.
 - Never commit local OpenClaw configuration, credentials, channel/account identifiers, notification targets, watchlists, holdings, state, caches, logs, screenshots, or generated results.
 
 See [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [DISCLAIMER.md](DISCLAIMER.md). Licensed under the [MIT License](LICENSE).

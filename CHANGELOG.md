@@ -2,9 +2,30 @@
 
 All notable changes are recorded here. Versions follow Semantic Versioning.
 
-## [0.2.0-rc.2] - Unreleased
+## [0.2.0] - 2026-08-23
 
-This corrective candidate is committed locally for review. It has not been tagged, pushed, published to ClawHub, released on GitHub, or announced.
+This stable release promotes the validated `0.2.0-rc.2` code and safety boundaries without adding new runtime features.
+
+### Changed
+
+- Promoted package, plugin manifest, lockfile, and Python version metadata from `0.2.0-rc.2` to `0.2.0`.
+- Updated installation and maintainer documentation so the default ClawHub entry follows stable `latest`, while the existing rc tags remain immutable.
+- Kept the version-consistency checks that fail when package/plugin/lockfile/Python metadata drifts.
+
+### Compatibility and security
+
+- OpenClaw remains the only supported runtime; minimum OpenClaw/plugin API is `>=2026.5.17`.
+- There is still no broker connector or order-execution capability, and notification delivery still fails closed without an explicit local target.
+- The plugin package's runtime dependency audit is clean. Full development or host dependency trees can still inherit advisories from the peer-supplied OpenClaw runtime and upstream transitive dependencies, which this plugin does not bundle. Keep OpenClaw current and review upstream advisories.
+
+### Release lineage
+
+- The public `v0.2.0-rc.1` and `v0.2.0-rc.2` tags remain unchanged.
+- `0.2.0` is the stable promotion of the corrected rc.2 line; it does not rewrite either candidate.
+
+## [0.2.0-rc.2] - 2026-08-23
+
+This corrective candidate was tagged, published as a GitHub prerelease, and published to the ClawHub `rc` tag. It was not published to npm or announced through community posts.
 
 ### Fixed
 
@@ -16,6 +37,7 @@ This corrective candidate is committed locally for review. It has not been tagge
 
 - `v0.2.0-rc.1` was pushed as a source tag, but no GitHub Release, ClawHub package, npm package, or announcement was created for it.
 - Release publication stopped when its Python `__version__` was found to remain at `0.1.0`; `0.2.0-rc.2` is the forward-only correction.
+- The rc.2 GitHub prerelease and ClawHub package point to the corrected immutable rc.2 commit; neither candidate tag was moved or overwritten.
 
 ## [0.2.0-rc.1] - 2026-08-23
 

@@ -1,12 +1,12 @@
 # ClawHub release procedure
 
-This procedure is for maintainers. The candidate is a **code plugin**, not a skill, so use `clawhub package ... --family code-plugin`; do not use `clawhub skill publish`.
+This procedure is for maintainers. The package is a **code plugin**, not a skill, so use `clawhub package ... --family code-plugin`; do not use `clawhub skill publish`.
 
 ## Current package contract
 
 - Package: `@cnan5336-dev/lobster-quant-agent`
 - Plugin id: `lobster-quant-agent`
-- Candidate: `0.2.0-rc.2`
+- Current release: `0.2.0`
 - Minimum OpenClaw/plugin API: `>=2026.5.17`
 - Release build baseline: OpenClaw/plugin SDK `2026.7.1`
 
@@ -17,7 +17,7 @@ Official references:
 - [Plugin validation fixes](https://docs.openclaw.ai/clawhub/plugin-validation-fixes)
 - [Tool plugin packaging](https://docs.openclaw.ai/plugins/tool-plugins)
 
-## Local candidate checks
+## Local release checks
 
 Run from a reviewed checkout with no credentials or private runtime files:
 
@@ -26,8 +26,8 @@ npm ci --omit=peer
 ./scripts/validate.sh
 ./scripts/test_clean_install.sh
 npx --yes clawhub@0.23.3 package validate .
-npx --yes clawhub@0.23.3 package publish . --family code-plugin --tags rc \
-  --changelog "ClawHub packaging, bilingual docs, synthetic demo, and privacy-safe first-use checks." \
+npx --yes clawhub@0.23.3 package publish . --family code-plugin --tags latest \
+  --changelog "Stable 0.2.0 promotion of the validated rc.2 package with aligned version metadata and no feature expansion." \
   --dry-run
 ```
 
@@ -39,7 +39,7 @@ ClawHub validation may create an ignored `reports/` directory containing local p
 
 Folder dry-run is useful during review, but a dirty working tree cannot prove that a tarball corresponds exactly to a public commit. Before a real publish:
 
-1. Obtain explicit permission to commit the reviewed candidate.
+1. Obtain explicit permission to commit the reviewed release.
 2. Confirm `git status --short` is empty and record `git rev-parse HEAD`.
 3. Build and validate from that exact commit in a fresh checkout.
 4. Confirm the package report's repository/ref metadata identifies that commit.
@@ -51,8 +51,8 @@ The following are intentionally not part of local preparation:
 
 ```bash
 # Real ClawHub publish — DO NOT RUN without explicit approval.
-clawhub package publish . --family code-plugin --tags rc \
-  --changelog "ClawHub packaging, bilingual docs, synthetic demo, and privacy-safe first-use checks."
+clawhub package publish . --family code-plugin --tags latest \
+  --changelog "Stable 0.2.0 promotion of the validated rc.2 package with aligned version metadata and no feature expansion."
 
 # Git tag, push, GitHub Release, npm publish, and community posts are also gated.
 ```

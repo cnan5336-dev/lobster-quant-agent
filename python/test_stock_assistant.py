@@ -36,7 +36,7 @@ class ReleaseMetadataTests(unittest.TestCase):
 
         self.assertIsNotNone(match)
         expected = package["version"]
-        self.assertEqual(expected, "0.2.0-rc.2")
+        self.assertEqual(expected, "0.2.0")
         self.assertEqual(manifest["version"], expected)
         self.assertEqual(package_lock["version"], expected)
         self.assertEqual(package_lock["packages"][""]["version"], expected)

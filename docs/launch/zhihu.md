@@ -19,7 +19,7 @@
 > - 通知目标是私密本地配置，缺失时必须 fail closed；
 > - 项目不连接券商，也不接受真实持仓或账号截图作为公开 Issue 材料。
 >
-> ## 三、从源码安装候选版
+> ## 三、安装稳定版或从源码安装
 >
 > ```bash
 > git clone https://github.com/cnan5336-dev/lobster-quant-agent.git
@@ -49,7 +49,7 @@
 >
 > ## 六、实现上的一个取舍
 >
-> OpenClaw 的托管插件安装会禁用 npm 生命周期脚本，因此不能假设安装时自动跑 pip。候选包把普通 HTTP 请求改成 Python 标准库适配器；只有 AkShare 增强路径是可选项，缺少时返回“暂缺”，而不是偷偷安装依赖或把数据发到别处。
+> OpenClaw 的托管插件安装会禁用 npm 生命周期脚本，因此不能假设安装时自动跑 pip。发布包把普通 HTTP 请求改成 Python 标准库适配器；只有 AkShare 增强路径是可选项，缺少时返回“暂缺”，而不是偷偷安装依赖或把数据发到别处。
 >
 > 项目地址：https://github.com/cnan5336-dev/lobster-quant-agent
 >

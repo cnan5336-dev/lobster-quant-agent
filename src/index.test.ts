@@ -11,7 +11,7 @@ describe("lobster-quant-agent", () => {
     expect(manifest.contracts.tools).toEqual(["lobster_quant"]);
     expect(manifest.description).toContain("No broker access");
     expect(manifest.version).toBe(packageJson.version);
-    expect(packageJson.version).toBe("0.2.0-rc.2");
+    expect(packageJson.version).toBe("0.2.0");
     expect(packageLock.version).toBe(packageJson.version);
     expect(packageLock.packages[""].version).toBe(packageJson.version);
     expect(pythonVersion).toBe(packageJson.version);

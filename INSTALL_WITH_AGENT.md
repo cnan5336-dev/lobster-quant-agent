@@ -86,4 +86,4 @@ Only after the user confirms, uninstall the plugin with `openclaw plugins uninst
 
 If OpenClaw rejects the write with `Config write rejected` or `size-drop`, stop. Do not bypass the guard or force-edit the configuration. Preserve the rejected artifact locally, run `openclaw config validate` and `openclaw doctor`, then follow the current OpenClaw troubleshooting guidance or ask the user how to proceed.
 
-The ClawHub command documented in README is future-facing until the package is actually published and its scan clears. During candidate review, do not attempt to resolve or install the nonexistent ClawHub listing.
+The ClawHub command documented in README resolves the public stable release. Before using it, inspect the package page, source link, requested version, compatibility metadata, and current scan state; do not silently substitute an rc or npm source.

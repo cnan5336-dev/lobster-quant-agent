@@ -41,10 +41,10 @@ if (!releaseNotes.startsWith(`# Lobster Quant Agent ${packageJson.version} `)) {
   errors.push(`release notes heading does not declare ${packageJson.version}`);
 }
 if (!readme.includes(`\`${packageJson.version}\``)) {
-  errors.push(`README does not name current candidate ${packageJson.version}`);
+  errors.push(`README does not name current release ${packageJson.version}`);
 }
-if (!clawhubGuide.includes(`Candidate: \`${packageJson.version}\``)) {
-  errors.push(`ClawHub guide does not name current candidate ${packageJson.version}`);
+if (!clawhubGuide.includes(`Current release: \`${packageJson.version}\``)) {
+  errors.push(`ClawHub guide does not name current release ${packageJson.version}`);
 }
 
 if (errors.length > 0) {
