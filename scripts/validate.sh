@@ -21,6 +21,7 @@ if [[ -x .venv/bin/python ]]; then
 fi
 
 "$python_command" -m compileall -q python/lobster_quant_agent python/test_stock_assistant.py
+node scripts/check-versions.mjs
 "$python_command" -m unittest discover -s python -p 'test_*.py'
 "$python_command" scripts/first_use_smoke.py
 

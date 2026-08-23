@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +8,7 @@ from unittest import mock
 import sys
 
 PACKAGE_DIR = Path(__file__).resolve().parent / "lobster_quant_agent"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PACKAGE_DIR))
 
 import cli as stock
@@ -17,6 +20,27 @@ from report_pipeline import (
     parse_analysis_candidates,
     render_report,
 )
+
+
+class ReleaseMetadataTests(unittest.TestCase):
+    def test_package_manifest_lock_and_python_versions_match(self):
+        package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        manifest = json.loads(
+            (REPO_ROOT / "openclaw.plugin.json").read_text(encoding="utf-8")
+        )
+        package_lock = json.loads(
+            (REPO_ROOT / "package-lock.json").read_text(encoding="utf-8")
+        )
+        python_init = (PACKAGE_DIR / "__init__.py").read_text(encoding="utf-8")
+        match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']$', python_init, re.M)
+
+        self.assertIsNotNone(match)
+        expected = package["version"]
+        self.assertEqual(expected, "0.2.0-rc.2")
+        self.assertEqual(manifest["version"], expected)
+        self.assertEqual(package_lock["version"], expected)
+        self.assertEqual(package_lock["packages"][""]["version"], expected)
+        self.assertEqual(match.group(1), expected)
 
 
 class StrategyLifecycleTests(unittest.TestCase):

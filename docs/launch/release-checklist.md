@@ -12,8 +12,9 @@ Check items only with evidence from the exact candidate. This checklist does not
 
 ## Version and compatibility
 
-- [ ] `package.json` and `openclaw.plugin.json` versions match.
+- [ ] `package.json`, `openclaw.plugin.json`, both root lockfile versions, and Python `__version__` match.
 - [ ] Version is greater than the prior public version and semantically justified.
+- [ ] A new rc.2 tag will be created after validation; the public `v0.2.0-rc.1` tag remains unchanged.
 - [ ] `openclaw.compat.pluginApi`, build versions, install source, peer dependency, and minimum host agree.
 - [ ] CHANGELOG and release notes match the actual diff.
 - [ ] macOS/Linux/Windows support statements distinguish tested, CI-only, static-only, and unsupported.

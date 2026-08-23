@@ -1,6 +1,6 @@
 {
   "name": "@cnan5336-dev/lobster-quant-agent",
-  "version": "0.2.0-rc.1",
+  "version": "0.2.0-rc.2",
   "description": "OpenClaw-only A-share and US-market research, alerts, and backtesting without broker access or order execution.",
   "type": "module",
   "license": "MIT",
@@ -34,8 +34,9 @@
     "audit:privacy": "python3 scripts/privacy_audit.py .",
     "demo:generate": "python3 scripts/generate_synthetic_demo.py",
     "demo:check": "python3 scripts/generate_synthetic_demo.py --check",
+    "version:check": "node scripts/check-versions.mjs",
     "pack:check": "node scripts/check-package.mjs",
-    "release:check": "npm run plugin:check && npm run demo:check && npm run pack:check && npm run audit:privacy",
+    "release:check": "npm run version:check && npm run plugin:check && npm run demo:check && npm run pack:check && npm run audit:privacy",
     "clawhub:validate": "clawhub package validate .",
     "clawhub:dry-run": "clawhub package publish . --family code-plugin --tags rc --changelog \"ClawHub packaging, bilingual docs, synthetic demo, and privacy-safe first-use checks.\" --dry-run"
   },

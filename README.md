@@ -51,7 +51,7 @@ ClawHub 发布并经安全扫描通过后，计划使用：
 openclaw plugins install clawhub:@cnan5336-dev/lobster-quant-agent
 ```
 
-如先公开 `0.2.0-rc.1` 供候选测试，应使用精确版本或 `@rc`，不要把候选版标成稳定 `latest`。
+如先公开 `0.2.0-rc.2` 供候选测试，应使用精确版本或 `@rc`，不要把候选版标成稳定 `latest`。
 
 安装脚本对同一 checkout 可重复执行。它会创建仓库内的 Python 虚拟环境、安装依赖、验证并链接插件、生成被 Git 忽略的本地配置副本，并只向 OpenClaw 写入非敏感的插件路径与安全默认值。它不会发送消息、启动监控、配置凭据或执行交易。
 
@@ -129,7 +129,7 @@ After a maintainer publishes the reviewed package and ClawHub security checks pa
 openclaw plugins install clawhub:@cnan5336-dev/lobster-quant-agent
 ```
 
-If `0.2.0-rc.1` is published for candidate testing first, use the exact version or the `@rc` tag; do not present the candidate as stable `latest`.
+If `0.2.0-rc.2` is published for candidate testing first, use the exact version or the `@rc` tag; do not present the candidate as stable `latest`.
 
 The installer is idempotent for the same checkout. It creates a repository-local Python virtual environment, installs dependencies, validates and links the plugin, creates an ignored local configuration copy, and writes only non-secret plugin paths and safe defaults to OpenClaw. It does not send a message, start monitoring, configure credentials, or perform a trade.
 

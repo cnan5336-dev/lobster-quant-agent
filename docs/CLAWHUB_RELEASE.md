@@ -6,7 +6,7 @@ This procedure is for maintainers. The candidate is a **code plugin**, not a ski
 
 - Package: `@cnan5336-dev/lobster-quant-agent`
 - Plugin id: `lobster-quant-agent`
-- Candidate: `0.2.0-rc.1`
+- Candidate: `0.2.0-rc.2`
 - Minimum OpenClaw/plugin API: `>=2026.5.17`
 - Release build baseline: OpenClaw/plugin SDK `2026.7.1`
 

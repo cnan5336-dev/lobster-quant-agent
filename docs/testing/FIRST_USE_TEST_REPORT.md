@@ -1,7 +1,7 @@
 # Clean-environment first-use test report
 
 Date: 2026-08-23 (Asia/Shanghai)
-Candidate: `0.2.0-rc.1`; exact commit is recorded by the post-commit verification output
+Candidate: committed local `0.2.0-rc.2`; the final commit SHA is recorded by post-commit verification output
 Status: local review evidence; not a release or real-user testimonial
 
 ## Environment actually tested
@@ -66,8 +66,9 @@ The smoke test verified:
 ### Package and ClawHub — tested locally
 
 - ClawHub Plugin Inspector: PASS, 0 breakages, 0 warnings, no findings.
-- ClawHub folder dry-run: PASS as `code-plugin`, package `@cnan5336-dev/lobster-quant-agent`, version `0.2.0-rc.1`, correct API/build/SDK/minimum-host fields.
-- Final package check after excluding Python caches/tests: 39 files, about 100 KB packed and 377 KB unpacked.
+- ClawHub Plugin Inspector and folder dry-run: PASS for package version `0.2.0-rc.2`, with 0 breakages, 0 warnings, and no findings.
+- The final post-commit dry-run must report the current rc.2 commit, and the verifier must require that value to equal `git rev-parse HEAD`; the exact SHA belongs in immutable verification output rather than this self-referential file.
+- Final package check after excluding Python caches/tests: 40 files, 101,649 bytes packed and 380,714 bytes unpacked.
 - The prerelease dry-run must use the `rc` tag; it must not replace `latest`.
 
 ## First-use blockers found and addressed
@@ -77,6 +78,7 @@ The smoke test verified:
 3. **Python `__pycache__` and test bytecode entered the initial dry-run payload.** Nested npm ignores plus package assertions now exclude them; package size fell from roughly 212 KB packed/622 KB unpacked to roughly 100 KB/377 KB.
 4. **An npm tarball is not a source checkout.** It intentionally omits TypeScript source/config, so the source installer must be tested from a clean source snapshot, while the tarball must be tested through OpenClaw's managed install path. The harness now tests both correct shapes separately.
 5. **Real uninstall in a nearly empty isolated profile hit OpenClaw's `size-drop` config-write guard.** The guard was not bypassed. Uninstall dry-run is verified; the harness removes the entire disposable profile. User-facing instructions now say to stop, validate, and follow OpenClaw troubleshooting if a real uninstall is rejected.
+6. **The `v0.2.0-rc.1` source tag retained a stale Python `__version__ = "0.1.0"`.** No GitHub Release or package was created. `0.2.0-rc.2` aligns package, plugin, lockfile, and Python versions and adds three validation layers to prevent recurrence; the public rc.1 tag remains unchanged.
 
 ## Isolation incident and correction
 
@@ -93,7 +95,7 @@ Before the isolation wrapper was added, one metadata-build command started OpenC
 | Linux | Static target only for this candidate | Run Ubuntu CI and a fresh Linux install on the exact committed candidate. |
 | Windows | Unsupported | POSIX file locks are required. |
 | ClawHub registry install | Not available | The package has not been published; only folder and npm-pack paths can be tested. |
-| Exact tarball-to-commit provenance | Post-commit verification required | Run the folder dry-run from a clean candidate commit and require its reported commit to equal `git rev-parse HEAD`; this is local evidence only until that commit is pushed. |
+| Exact tarball-to-commit provenance | Post-commit verification required | Run the folder dry-run from the clean rc.2 candidate commit and require its reported commit to equal `git rev-parse HEAD`; this remains local evidence until that commit is pushed. |
 | Human comprehension/UX | Not independently validated | Requires 3–5 real users following the public docs without maintainer guidance. |
 
 ## What automation can and cannot replace

@@ -2,9 +2,24 @@
 
 All notable changes are recorded here. Versions follow Semantic Versioning.
 
-## [0.2.0-rc.1] - Unreleased
+## [0.2.0-rc.2] - Unreleased
 
-This is a local release candidate. It has not been committed, tagged, pushed, published to ClawHub, or announced.
+This corrective candidate is committed locally for review. It has not been tagged, pushed, published to ClawHub, released on GitHub, or announced.
+
+### Fixed
+
+- Aligned `package.json`, `openclaw.plugin.json`, both root lockfile versions, and the Python package `__version__` at `0.2.0-rc.2`.
+- Added a reusable version-consistency check plus independent Python and Vitest assertions so package/plugin/Python version drift fails validation.
+- Added corrective release notes and validation guidance without moving or overwriting the public `v0.2.0-rc.1` tag.
+
+### Release status
+
+- `v0.2.0-rc.1` was pushed as a source tag, but no GitHub Release, ClawHub package, npm package, or announcement was created for it.
+- Release publication stopped when its Python `__version__` was found to remain at `0.1.0`; `0.2.0-rc.2` is the forward-only correction.
+
+## [0.2.0-rc.1] - 2026-08-23
+
+This source candidate was committed, pushed, and tagged, but it was not published as a GitHub Release or package after the internal Python version mismatch was found.
 
 ### Added
 

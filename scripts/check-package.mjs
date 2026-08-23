@@ -27,6 +27,7 @@ const required = [
   "dist/index.js",
   "python/lobster_quant_agent/cli.py",
   "scripts/install.sh",
+  "scripts/check-versions.mjs",
   "scripts/run-openclaw-isolated.mjs",
   "scripts/test_clean_install.sh",
   "scripts/privacy_audit.py",

@@ -20,6 +20,7 @@ The `plugin:build`, `plugin:check`, and `plugin:validate` npm scripts wrap OpenC
 
 - `package.json` is the package-version authority.
 - If `openclaw.plugin.json` contains `version`, it must match `package.json` exactly.
+- `python/lobster_quant_agent/__init__.py::__version__` and the root package-lock versions must match `package.json` exactly.
 - `openclaw.compat.pluginApi` is the minimum host API contract and is not the plugin release version.
 - `openclaw.build.openclawVersion` and `pluginSdkVersion` record the release build/test baseline.
 
