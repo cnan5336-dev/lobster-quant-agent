@@ -9,6 +9,7 @@ import subprocess
 import sys
 import re
 import hashlib
+import importlib
 import math
 import shlex
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1463,6 +1464,105 @@ MODEL_FALLBACK_CANDIDATES = [
 MODEL_FALLBACK_LOG_PATH = _state_path("model_fallback.log")
 
 
+def _load_model_traffic_controller():
+    """The optional local controller is the sole owner of traffic-switch state."""
+    try:
+        return importlib.import_module("model_traffic_control")
+    except ModuleNotFoundError as exc:
+        if exc.name == "model_traffic_control":
+            return None
+        raise
+
+
+def _model_route_snapshot():
+    """Read once per request; a broken installed controller must never go legacy."""
+    try:
+        controller = _load_model_traffic_controller()
+        if controller is None:
+            return {"ok": True, "installed": False, "mode": "legacy"}
+        result = controller.route_for_request()
+        if not isinstance(result, dict) or not isinstance(result.get("installed"), bool):
+            raise ValueError("invalid controller response")
+        if result["installed"] is False and result.get("ok") is True:
+            return {"ok": True, "installed": False, "mode": "legacy"}
+        route = {key: result.get(key) for key in ("ok", "installed", "mode", "selected_model", "error", "config_path")}
+        if route.get("ok") is not True:
+            route["ok"] = False
+            route["selected_model"] = None
+            return route
+        # The controller validates policy/provider consistency and owns model ids.
+        # Do not duplicate its on/off mapping here; retain only a safe API shape.
+        selected = route.get("selected_model")
+        if route.get("mode") not in {"on", "off"} or not isinstance(selected, str) or not re.fullmatch(r"[^\s/]+/[^\s]+", selected):
+            raise ValueError("invalid selected route")
+        if not isinstance(route.get("config_path"), str) or not os.path.isabs(route["config_path"]):
+            raise ValueError("missing controlled config path")
+        try:
+            _model_subprocess_options(route)
+        except Exception:
+            return {"ok": False, "installed": True, "mode": "blocked", "selected_model": None,
+                    "error": "controlled_environment_unavailable"}
+        return route
+    except Exception:
+        return {"ok": False, "installed": True, "mode": "blocked", "selected_model": None,
+                "error": "controller_unavailable"}
+
+
+def _model_subprocess_options(route=None):
+    if not route or not route.get("installed"):
+        return {}
+    # Bind both discovery and inference to the same config the controller checked.
+    # A separate environment leaves other requests and the parent process intact.
+    adapter = importlib.import_module("model_traffic_adapter")
+    return {"env": adapter.controlled_subprocess_env(route["config_path"])}
+
+
+def _model_route_error(route):
+    return {"ok": False, "error_type": "traffic_policy_blocked",
+            "message": "模型流量开关状态不可用或与网关配置不一致，本次未发起模型请求；请检查 model codex status。",
+            "routing": {key: value for key, value in route.items() if key != "config_path"},
+            "attempts": [], "models": []}
+
+
+def model_codex_control(action="status"):
+    action = str(action).strip().lower()
+    if action not in {"on", "off", "status"}:
+        return {"ok": False, "error": "用法：model codex on|off|status"}
+    try:
+        controller = _load_model_traffic_controller()
+        if controller is None:
+            return {"ok": action == "status", "installed": False, "mode": "legacy",
+                    "configured_primary_model": MODEL_PRIMARY or None,
+                    "configured_fallback_models": list(MODEL_FALLBACK_CANDIDATES),
+                    "message": "未安装 Codex 流量控制器；模型请求沿用原有 OpenClaw／插件配置。",
+                    "model_request_sent": False}
+        result = controller.get_status() if action == "status" else controller.set_mode(action)
+        if not isinstance(result, dict) or not isinstance(result.get("installed"), bool):
+            raise ValueError("invalid controller response")
+        if result["installed"] is False:
+            result = {**result, "routing_mode": "legacy",
+                      "message": "Codex 流量开关尚未初始化；模型请求沿用原有 OpenClaw／插件配置。"}
+        return {**result, "model_request_sent": False}
+    except Exception:
+        return {"ok": False, "installed": True, "mode": "blocked", "selected_model": None,
+                "error": "controller_unavailable", "model_request_sent": False,
+                "message": "Codex 流量控制器不可用；未切换到其他模型。"}
+
+
+def _dispatch_model_command(args):
+    action = str(args[0]).strip().lower() if args else "status"
+    if action == "status" and len(args) <= 1:
+        return model_codex_control("status")
+    if action == "codex" and len(args) == 2:
+        return model_codex_control(args[1])
+    if action == "ping" and len(args) == 1:
+        return model_ping()
+    if action in {"ask", "run"}:
+        prompt = " ".join(args[1:]).strip()
+        return model_call_with_fallback(prompt) if prompt else {"ok": False, "error": "用法：model ask \"需要模型处理的文本\""}
+    return {"ok": False, "error": "用法：model [status|codex on|codex off|codex status|ping|ask 文本]"}
+
+
 def _classify_model_error(text):
     lowered = str(text or "").lower()
     patterns = [
@@ -1514,14 +1614,15 @@ def _model_error_summary(error_type):
     }.get(error_type, "模型调用失败")
 
 
-def _configured_model_metadata(timeout_seconds=20):
+def _configured_model_metadata(timeout_seconds=20, route=None):
     try:
         result = subprocess.run(
             ["openclaw", "models", "list", "--json"],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
-            check=False
+            check=False,
+            **_model_subprocess_options(route),
         )
         if result.returncode != 0:
             return {"keys": set(), "default": None, "error_type": "discovery_failed"}
@@ -1543,7 +1644,12 @@ def _configured_model_keys():
     return _configured_model_metadata()["keys"]
 
 
-def _model_candidates(metadata):
+def _model_candidates(metadata, route=None):
+    route = _model_route_snapshot() if route is None else route
+    if not route.get("ok"):
+        return []
+    if route.get("installed"):
+        return [route["selected_model"]]
     primary = MODEL_PRIMARY or metadata.get("default")
     return list(dict.fromkeys(item for item in [primary] + MODEL_FALLBACK_CANDIDATES[:2] if item))
 
@@ -1559,8 +1665,13 @@ def _model_budget(timeout_seconds):
     return budget
 
 
-def _run_model_once(model, prompt="只回复pong", timeout_seconds=45):
+def _run_model_once(model, prompt="只回复pong", timeout_seconds=45, route=None):
     started = time.monotonic()
+    controlled = bool(route and route.get("installed"))
+    if controlled and model != route.get("selected_model"):
+        return {"ok": False, "model": model, "latency_seconds": 0,
+                "error_type": "traffic_policy_blocked", "request_id": None,
+                "provider_summary": "请求模型与受控路由不一致，未发起请求。"}
     # One-shot inference has no agent tools, workspace bootstrap or delivery.
     # Older hosts fail explicitly; never retry via a full tool-enabled agent.
     command = [
@@ -1570,12 +1681,19 @@ def _run_model_once(model, prompt="只回复pong", timeout_seconds=45):
         "--json"
     ]
     try:
+        options = _model_subprocess_options(route)
+    except Exception:
+        return {"ok": False, "model": model, "latency_seconds": 0,
+                "error_type": "traffic_policy_blocked", "request_id": None,
+                "provider_summary": "受控模型执行环境不一致，未发起请求。"}
+    try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
-            check=False
+            check=False,
+            **options,
         )
     except subprocess.TimeoutExpired as exc:
         latency = round(time.monotonic() - started, 3)
@@ -1608,6 +1726,20 @@ def _run_model_once(model, prompt="只回复pong", timeout_seconds=45):
 
     try:
         payload = json.loads(result.stdout or "{}")
+        evidence = {}
+        if controlled:
+            # OpenClaw local model.run reports the resolved provider and bare id,
+            # after alias resolution. A requested --model alone is not evidence.
+            provider = payload.get("provider") if isinstance(payload, dict) else None
+            resolved_id = payload.get("model") if isinstance(payload, dict) else None
+            expected_provider, expected_id = model.split("/", 1)
+            complete = isinstance(provider, str) and bool(provider) and isinstance(resolved_id, str) and bool(resolved_id)
+            if not complete or provider != expected_provider or resolved_id != expected_id:
+                return {"ok": False, "model": model, "latency_seconds": latency,
+                        "error_type": "model_routing_mismatch" if complete else "model_routing_unverified",
+                        "request_id": None,
+                        "provider_summary": "模型返回的路由证据缺失或与选定模型不一致；结果未采用，未尝试其他模型。"}
+            evidence = {"routing_verified": True, "resolved_model": provider + "/" + resolved_id}
         texts = [
             str(item.get("text", "")).strip()
             for item in payload.get("outputs", [])
@@ -1622,7 +1754,8 @@ def _run_model_once(model, prompt="只回复pong", timeout_seconds=45):
             "error_type": None,
             "request_id": None,
             "provider_summary": f"{payload.get('provider', 'unknown')} 返回成功",
-            "text": "\n".join(texts)
+            "text": "\n".join(texts),
+            **evidence,
         }
     except Exception as exc:
         return {
@@ -1649,14 +1782,19 @@ def _write_model_fallback_log(event):
 def model_call_with_fallback(prompt, timeout_seconds=90):
     started = time.monotonic()
     deadline = started + _model_budget(timeout_seconds)
-    metadata = _configured_model_metadata(min(20, max(0.1, deadline - time.monotonic())))
+    route = _model_route_snapshot()
+    if not route.get("ok"):
+        return _model_route_error(route)
+    discovery_timeout = min(20, max(0.1, deadline - time.monotonic()))
+    metadata = (_configured_model_metadata(discovery_timeout, route=route) if route.get("installed")
+                else _configured_model_metadata(discovery_timeout))
     if metadata.get("error_type"):
         return {"ok": False, "message": _model_error_summary(metadata["error_type"]),
                 "error_type": metadata["error_type"], "attempts": [],
                 "latency_seconds": round(time.monotonic() - started, 3)}
     allowed = metadata["keys"]
     attempts = []
-    candidates = _model_candidates(metadata)
+    candidates = _model_candidates(metadata, route)
     if not candidates:
         return {"ok": False, "message": "没有可用默认模型；请检查 OpenClaw 默认模型或显式配置 primaryModel。", "attempts": []}
     for index, model in enumerate(candidates):
@@ -1676,7 +1814,8 @@ def model_call_with_fallback(prompt, timeout_seconds=90):
                                  "error_type": "timeout", "request_id": None,
                                  "provider_summary": "模型请求总时间预算已耗尽"})
                 break
-            attempt = _run_model_once(model, prompt, remaining)
+            attempt = (_run_model_once(model, prompt, remaining, route=route) if route.get("installed")
+                       else _run_model_once(model, prompt, remaining))
         attempts.append(attempt)
         if attempt.get("ok"):
             if index > 0:
@@ -1702,7 +1841,7 @@ def model_call_with_fallback(prompt, timeout_seconds=90):
                 "error_type": attempt.get("error_type"),
                 "request_id": attempt.get("request_id")
             })
-        if attempt.get("error_type") in {"unsupported_cli", "cli_unavailable"}:
+        if attempt.get("error_type") in {"unsupported_cli", "cli_unavailable", "traffic_policy_blocked", "model_routing_mismatch", "model_routing_unverified"}:
             return {"ok": False, "message": attempt["provider_summary"],
                     "attempts": attempts, "latency_seconds": round(time.monotonic() - started, 3)}
 
@@ -1724,11 +1863,16 @@ def model_call_with_fallback(prompt, timeout_seconds=90):
 def model_ping():
     started = time.monotonic()
     deadline = started + _model_budget(90)
-    metadata = _configured_model_metadata(min(20, max(0.1, deadline - time.monotonic())))
+    route = _model_route_snapshot()
+    if not route.get("ok"):
+        return _model_route_error(route)
+    discovery_timeout = min(20, max(0.1, deadline - time.monotonic()))
+    metadata = (_configured_model_metadata(discovery_timeout, route=route) if route.get("installed")
+                else _configured_model_metadata(discovery_timeout))
     if metadata.get("error_type"):
         return {"ok": False, "message": _model_error_summary(metadata["error_type"]), "models": []}
     allowed = metadata["keys"]
-    candidates = _model_candidates(metadata)
+    candidates = _model_candidates(metadata, route)
     results = []
     for model in candidates:
         if model not in allowed:
@@ -1747,9 +1891,10 @@ def model_ping():
                             "error_type": "timeout", "request_id": None,
                             "provider_summary": "总时间预算已耗尽，此模型未开始探测"})
             break
-        result = _run_model_once(model, "只回复pong", min(45, remaining))
+        result = (_run_model_once(model, "只回复pong", min(45, remaining), route=route) if route.get("installed")
+                  else _run_model_once(model, "只回复pong", min(45, remaining)))
         results.append(result)
-        if result.get("error_type") in {"unsupported_cli", "cli_unavailable"}:
+        if result.get("error_type") in {"unsupported_cli", "cli_unavailable", "traffic_policy_blocked", "model_routing_mismatch", "model_routing_unverified"}:
             break
     return {
         "ok": any(item.get("ok") for item in results),
@@ -3289,6 +3434,11 @@ def handle_natural_language_command(text):
     text = " ".join(str(text).strip().split())
     if not text:
         return {"error": "空命令"}
+    codex_action = {
+        "开启codex流量": "on", "关闭codex流量": "off", "codex流量状态": "status",
+    }.get(re.sub(r"\s+", "", text).casefold())
+    if codex_action:
+        return model_codex_control(codex_action)
 
     name_code_map = {
         "中芯国际": "688981",
@@ -6802,17 +6952,7 @@ def main():
             else:
                 print_json({"error": f"未知回测操作：{action}"})
         elif cmd == "model":
-            action = sys.argv[2] if len(sys.argv) > 2 else "ping"
-            if action == "ping":
-                print_json(model_ping())
-            elif action in {"ask", "run"}:
-                prompt = " ".join(sys.argv[3:]).strip()
-                if not prompt:
-                    print_json({"error": "用法：model ask \"需要模型处理的文本\""})
-                else:
-                    print_json(model_call_with_fallback(prompt))
-            else:
-                print_json({"error": f"未知模型操作：{action}"})
+            print_json(_dispatch_model_command(sys.argv[2:]))
         elif cmd in {"monitor_once", "盯盘一次"}:
             monitor_once()
         elif cmd in {"monitor_loop", "盯盘循环"}:

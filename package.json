@@ -54,6 +54,7 @@
     "SECURITY.md",
     "DISCLAIMER.md",
     "docs/demo",
+    "docs/model-traffic-switch.md",
     "LICENSE"
   ],
   "engines": {

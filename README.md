@@ -101,6 +101,8 @@ python3 scripts/first_use_smoke.py
 
 开发中的可靠性修复及验证范围见[功能测试矩阵](docs/validation/2026-10-03-reliability.md)。工具也支持 `kline 600519 30`、`news_map 新能源`、`morning_news 10`、`us_quote AAPL`、`us_index` 和 `lhb 20260520`；龙虎榜八位参数表示日期，六位参数表示股票代码。新闻发布时间暂不可核验时会明确提示。
 
+已配置本机 DeepSeek 与 CLIProxyAPI 的用户可显式初始化[Codex 流量开关](docs/model-traffic-switch.md)，使用 `model codex on|off|status` 控制后续模型请求。安装项目本身不会启用它；未初始化时继续使用原有配置。`model` 不带参数只查询状态，不调用模型。
+
 ## English overview
 
 Lobster Quant Agent puts quote lookup, research reports, conditional alerts, natural-language strategy monitoring, and historical backtesting behind one OpenClaw tool: `lobster_quant`.

@@ -14,6 +14,7 @@ import cli as stock
 
 class ModelRoutingTests(unittest.TestCase):
     def setUp(self):
+        mock.patch.object(stock, "_model_route_snapshot", return_value={"ok": True, "installed": False, "mode": "legacy"}).start()
         self.logs = mock.patch.object(stock, "_write_model_fallback_log").start()
         mock.patch.object(stock, "MODEL_PRIMARY", "").start()
         mock.patch.object(stock, "MODEL_FALLBACK_CANDIDATES", []).start()
