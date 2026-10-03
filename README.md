@@ -99,6 +99,8 @@ python3 scripts/first_use_smoke.py
 
 这些文字只是功能示例，不代表推荐、实际持仓、既有提醒或历史成绩。
 
+开发中的可靠性修复及验证范围见[功能测试矩阵](docs/validation/2026-10-03-reliability.md)。工具也支持 `kline 600519 30`、`news_map 新能源`、`morning_news 10`、`us_quote AAPL`、`us_index` 和 `lhb 20260520`；龙虎榜八位参数表示日期，六位参数表示股票代码。新闻发布时间暂不可核验时会明确提示。
+
 ## English overview
 
 Lobster Quant Agent puts quote lookup, research reports, conditional alerts, natural-language strategy monitoring, and historical backtesting behind one OpenClaw tool: `lobster_quant`.

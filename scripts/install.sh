@@ -42,6 +42,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+existing_install=false
 if openclaw plugins inspect lobster-quant-agent --json >"$inspect_file" 2>/dev/null; then
   installed_root="$(python3 - "$inspect_file" <<'PY'
 import json, pathlib, sys
@@ -49,19 +50,24 @@ data = json.loads(pathlib.Path(sys.argv[1]).read_text())
 print((data.get("plugin") or {}).get("rootDir") or "")
 PY
 )"
-  if [[ -n "$installed_root" && "$installed_root" != "$repo_root" ]]; then
+  if [[ -z "$installed_root" || "$installed_root" != "$repo_root" ]]; then
     echo "A different lobster-quant-agent installation already exists at: $installed_root" >&2
     echo "Review it manually; this installer will not overwrite it." >&2
     exit 1
   fi
+  existing_install=true
 else
   openclaw plugins install -l "$repo_root"
 fi
 
 openclaw plugins enable lobster-quant-agent
 
-state_dir="${LOBSTER_QUANT_STATE_DIR:-${HOME}/.openclaw/lobster-quant-agent}"
-batch_json="$(python3 - "$repo_root/.venv/bin/python" "$state_dir" <<'PY'
+# Defaults apply only to a new installation. Re-running an installer for this
+# checkout must preserve the user's channel, destinations, state and interpreter
+# selections without reading their private configuration into the installer.
+if [[ "$existing_install" == false ]]; then
+  state_dir="${LOBSTER_QUANT_STATE_DIR:-${HOME}/.openclaw/lobster-quant-agent}"
+  batch_json="$(python3 - "$repo_root/.venv/bin/python" "$state_dir" <<'PY'
 import json, sys
 print(json.dumps([
     {"path": "plugins.entries.lobster-quant-agent.config.pythonExecutable", "value": sys.argv[1]},
@@ -72,8 +78,9 @@ print(json.dumps([
 ]))
 PY
 )"
-openclaw config set --batch-json "$batch_json" --dry-run
-openclaw config set --batch-json "$batch_json"
+  openclaw config set --batch-json "$batch_json" --dry-run
+  openclaw config set --batch-json "$batch_json"
+fi
 openclaw config validate
 openclaw plugins inspect lobster-quant-agent --runtime --json >/dev/null
 

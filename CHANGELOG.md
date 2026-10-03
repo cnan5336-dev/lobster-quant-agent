@@ -2,6 +2,26 @@
 
 All notable changes are recorded here. Versions follow Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+- Preserve every supported strategy condition, comparison, direction, timeframe and explicit symbol; reject ambiguous combinations instead of silently changing their meaning. Return a readable execution preview and keep the previous strategy when parsing fails.
+- Fetch only the data required by each strategy, share a bounded worker pool, cache daily history briefly, and report per-source timing. Reject stale or invalid data before evaluating signals.
+- Commit alert activation only after delivery, preserve activation across unavailable data, and restore enabled monitoring through the verified process lifecycle.
+- Keep report dates, scope, source evidence and missing-data warnings consistent. Do not present live quotes as historical reports or count duplicate leaderboard rows as additional money flows.
+- Validate backtest bars and conditions, normalize volume units, calculate requested moving-average windows, disclose conservative execution assumptions and retain the previous saved strategy when a run fails.
+- Use a verified previous-session close for US daily price changes rather than a five-day chart reference.
+- Connect documented K-line, news mapping, morning-news and US aliases to the CLI/plugin; distinguish leaderboard dates from stock codes and reject invalid arguments before fetching.
+- Inherit the configured OpenClaw default model for explicit model helpers, use context-free inference, and share one timeout budget across attempts. Preserve plugin arguments and make cancellation/timeouts explicit.
+- Preserve private channel, notification, interpreter and state settings when the source installer is run again.
+- Update the development-only Vitest runner to patched 4.1.11 for GHSA-82fw-gwwq-j7x9; runtime dependencies are unchanged.
+
+### Validation and boundaries
+
+- Added synthetic regression tests for strategy semantics, monitoring, reports, historical data, models, installation and the plugin bridge. See [the reliability test matrix](docs/validation/2026-10-03-reliability.md).
+- No version/tag/package release is included. Trading-session delivery and long-running service recovery still require a supervised operational check.
+
 ## [0.2.0] - 2026-08-23
 
 This stable release promotes the validated `0.2.0-rc.2` code and safety boundaries without adding new runtime features.
