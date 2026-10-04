@@ -2,21 +2,21 @@ import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-const packed = spawnSync("npm", ["pack", "--dry-run", "--json"], {
+const packed = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts", "--offline"], {
   cwd: new URL("..", import.meta.url),
   encoding: "utf8",
 });
 
 if (packed.status !== 0) {
-  process.stderr.write(packed.stderr || packed.stdout || "npm pack --dry-run failed\n");
+  process.stderr.write(`npm pack --dry-run failed (exit ${packed.status ?? "unavailable"})\n`);
   process.exit(packed.status ?? 1);
 }
 
 let report;
 try {
   [report] = JSON.parse(packed.stdout);
-} catch (error) {
-  process.stderr.write(`Could not parse npm pack report: ${error.message}\n`);
+} catch {
+  process.stderr.write("Could not parse npm pack report\n");
   process.exit(1);
 }
 
@@ -26,6 +26,10 @@ const required = [
   "openclaw.plugin.json",
   "dist/index.js",
   "python/lobster_quant_agent/cli.py",
+  "python/lobster_quant_agent/model_traffic_control.py",
+  "python/lobster_quant_agent/model_traffic_adapter.py",
+  "scripts/prepare-cliproxy-key.py",
+  "docs/model-traffic-switch.md",
   "scripts/install.sh",
   "scripts/check-versions.mjs",
   "scripts/run-openclaw-isolated.mjs",
@@ -46,12 +50,15 @@ const forbidden = [
   /(?:^|\/)__pycache__\//,
   /\.py[co]$/,
   /^python\/test_.*\.py$/,
-  /^reports\//,
-  /^results\//,
-  /^backtests\//,
-  /^screenshots\/private\//,
+  /(?:^|\/)(?:reports|results|backtests|memory|logs|cache|\.openclaw|cliproxy-private|request-logs|runtime-state|session-state|auth-state)(?:\/|$)/i,
+  /(?:^|\/)screenshots\/private\//i,
   /(?:^|\/)(?:\.env|credentials|secrets)(?:[./]|$)/i,
-  /^config\/.*(?:local|private|secret|token)/i,
+  /(?:^|\/)config\/.*(?:local|private|secret|token)/i,
+  /(?:^|\/)(?:\.?client[-_]key|proxy[-_]client|auth[-_]profiles?|sessions?|request[-_]history|model[-_]traffic[-_]policy|cliproxy[-_]switch[-_]policy|\.?cliproxy[-_]switch[-_]installed)(?:[._-][^/]*)?(?:\/|$)/i,
+  /(?:^|\/)(?:openclaw\.(?:json5?|ya?ml)|auth\.(?:json5?|ya?ml)|hosts\.yml)(?:[._-][^/]*)?$/i,
+  /(?:^|\/)(?:market_watchlist|market_monitor_state|backtest_config|openclaw-workspace-state)\.json$/i,
+  /(?:^|\/)(?:market_monitor_state\.json|[^/]+\.delivery\.json|[^/]+\.initialized|\.monitor-state-[^/]+\.tmp)(?:[._-][^/]*)?(?:\/|$)/i,
+  /\.(?:log|jsonl|har|db|sqlite3?|pid|session|lock|pem|key|p12|pickle)(?:[._-][^/]*)?$/i,
 ];
 
 const missing = required.filter((path) => !files.has(path));

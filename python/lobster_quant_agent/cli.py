@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import tempfile
 import os
 import io
 import contextlib
@@ -9,13 +10,20 @@ import subprocess
 import sys
 import re
 import hashlib
+import importlib
+import math
+import shlex
+import stat
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, time as datetime_time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import http_client as requests
 
-from report_pipeline import render_report
+from report_pipeline import render_report, fallback_analysis
+from channel_adapters import get_channel_adapter
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -65,6 +73,46 @@ def _state_path(*parts):
 WATCHLIST_PATH = _state_path("market_watchlist.json")
 
 
+def _validated_notify_channel(channel):
+    if not isinstance(channel, str) or not channel.strip():
+        raise ValueError("notification_channel_invalid")
+    value = _normalize_channel_name(channel)
+    if value not in {"weixin", "telegram", "qq"}:
+        raise ValueError("notification_channel_invalid")
+    return value
+
+
+def _notification_scope_error(code):
+    messages = {
+        "no_notification_channels": "未配置通知渠道；本次未发送。",
+        "notification_channel_invalid": "通知渠道无效或当前运行方式不支持；本次未发送。",
+        "notification_config_unavailable": "无法读取有效的通知配置；本次未发送。",
+    }
+    return {"ok": False, "skipped": True, "error": code, "error_code": code,
+            "message": messages[code], "notify_channels": [], "results": [],
+            "successful_channels": [], "failed_channels": []}
+
+
+def _notification_channel_scope(channels=None):
+    if channels is None:
+        try:
+            cfg = load_watchlist_config()
+            monitor = cfg.get("monitor")
+            if not isinstance(monitor, dict):
+                raise ValueError("notification_config_unavailable")
+        except Exception:
+            return _notification_scope_error("notification_config_unavailable")
+    else:
+        monitor = {"notify_channels": channels}
+    try:
+        normalized = _normalize_notify_channels(monitor)
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
+    if not normalized:
+        return _notification_scope_error("no_notification_channels")
+    return {"ok": True, "notify_channels": normalized}
+
+
 def _normalize_channel_name(channel):
     value = str(channel or "").strip().lower()
     if value in {"weixin", "wechat", "微信", "openclaw-weixin"}:
@@ -81,32 +129,35 @@ def _default_output_channel():
 
 
 def _normalize_notify_channels(monitor, include_fallback=True):
-    raw = []
+    # Presence matters: an explicit empty list is an instruction not to send.
+    missing = False
     if isinstance(monitor, dict):
-        configured = monitor.get("notify_channels")
-        if isinstance(configured, list):
-            raw.extend(configured)
-        elif configured:
-            raw.append(configured)
-        legacy = monitor.get("notify_channel")
-        if legacy:
-            raw.append(legacy)
-    elif monitor:
-        raw.append(monitor)
-
+        if "notify_channels" in monitor:
+            raw = monitor["notify_channels"]
+        elif "notify_channel" in monitor:
+            raw = monitor["notify_channel"]
+            if raw == "":
+                raw = []
+        else:
+            missing = True
+            raw = []
+    elif monitor is None:
+        missing = True
+        raw = []
+    else:
+        raw = monitor
+    if missing and include_fallback:
+        configured = os.environ.get("LOBSTER_QUANT_NOTIFY_CHANNELS", "")
+        raw = configured.split(",") if configured.strip() else []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("notification_channel_invalid")
     normalized = []
     for item in raw:
-        channel = _normalize_channel_name(item)
-        if channel and channel not in normalized:
+        channel = _validated_notify_channel(item)
+        if channel not in normalized:
             normalized.append(channel)
-
-    if not normalized and include_fallback:
-        configured = os.environ.get("LOBSTER_QUANT_NOTIFY_CHANNELS", "")
-        normalized = [
-            _normalize_channel_name(item)
-            for item in configured.split(",")
-            if item.strip()
-        ]
     return normalized
 
 
@@ -192,6 +243,7 @@ def _default_watchlist_config():
 def _normalize_monitor_config(cfg):
     defaults = _default_watchlist_config()
     monitor = cfg.setdefault("monitor", {})
+    channels = _normalize_notify_channels(monitor)
     old_mode = str(monitor.get("mode", "normal"))
     if old_mode in {"low", "medium", "high"}:
         old_mode = "normal"
@@ -210,7 +262,6 @@ def _normalize_monitor_config(cfg):
     monitor.setdefault("enabled", False)
     monitor.setdefault("market_hours_only", True)
     monitor.setdefault("source_channel", os.environ.get("LOBSTER_QUANT_CHANNEL", "telegram"))
-    channels = _normalize_notify_channels(monitor)
     monitor["notify_channels"] = channels
     monitor["notify_channel"] = channels[0] if channels else ""
     monitor.setdefault("last_notify_result", None)
@@ -235,14 +286,15 @@ def load_watchlist_config():
         with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception:
-        cfg = _default_watchlist_config()
-
+        raise ValueError("盯盘配置无效或不可读取；请修复配置后重试。") from None
+    if not isinstance(cfg, dict) or ("monitor" in cfg and not isinstance(cfg["monitor"], dict)):
+        raise ValueError("盯盘配置格式无效；请修复配置后重试。")
     default = _default_watchlist_config()
-    for k, v in default.items():
-        if k not in cfg:
-            cfg[k] = v
-    if "enabled" not in cfg.get("monitor", {}):
-        cfg["monitor"] = default["monitor"]
+    for key, value in default.items():
+        if key not in cfg:
+            cfg[key] = value
+    # Missing enabled must not discard an existing explicit notification scope.
+    cfg["monitor"].setdefault("enabled", False)
     return _normalize_monitor_config(cfg)
 
 
@@ -257,7 +309,9 @@ def save_watchlist_config(cfg):
 
 
 def _normalize_stock_item(code, name=None, note=None):
-    code = str(code).strip()
+    code = re.sub(r"^(?:sh|sz)", "", str(code).strip().lower())
+    if not re.fullmatch(r"[0-9]{6}", code):
+        raise ValueError("股票池证券代码必须为六位数字，可带 sh/sz 前缀")
     name = (name or "").strip() or code
     market = "sh" if code.startswith(("5", "6", "9")) else "sz"
     return {
@@ -277,9 +331,9 @@ def _pool_key(pool):
 
 
 def watchlist_add(pool, code, name=None, note=None):
-    cfg = load_watchlist_config()
     key = _pool_key(pool)
     item = _normalize_stock_item(code, name, note)
+    cfg = load_watchlist_config()
     cfg[key] = [x for x in cfg.get(key, []) if str(x.get("code")) != item["code"]]
     cfg[key].append(item)
     save_watchlist_config(cfg)
@@ -329,7 +383,24 @@ def watchlist_list(pool=None):
 
 
 def monitor_set(enabled, mode=None, source_channel=None, notify_channels=None):
-    cfg = load_watchlist_config()
+    try:
+        requested = (_normalize_notify_channels({"notify_channels": notify_channels}, include_fallback=False)
+                     if notify_channels is not None else None)
+        source = _validated_notify_channel(source_channel) if source_channel is not None else None
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
+    if bool(enabled) and requested == []:
+        return _notification_scope_error("no_notification_channels")
+    try:
+        cfg = load_watchlist_config()
+    except Exception:
+        return _notification_scope_error("notification_config_unavailable")
+    try:
+        channels = requested if requested is not None else _normalize_notify_channels(cfg.get("monitor", {}))
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
+    if bool(enabled) and not channels:
+        return _notification_scope_error("no_notification_channels")
     cfg.setdefault("monitor", _default_watchlist_config()["monitor"])
     profiles = _default_monitor_profiles()
 
@@ -360,17 +431,12 @@ def monitor_set(enabled, mode=None, source_channel=None, notify_channels=None):
     cfg["monitor"]["targets"] = profile.get("targets", ["holding_pool", "watch_pool"])
     cfg["monitor"]["cooldown_minutes"] = profile.get("cooldown_minutes", 60)
     cfg["monitor"]["use_llm"] = bool(profile.get("use_llm", False))
-    if source_channel:
-        cfg["monitor"]["source_channel"] = _normalize_channel_name(source_channel)
+    if source is not None:
+        cfg["monitor"]["source_channel"] = source
     else:
         cfg["monitor"].setdefault(
             "source_channel", os.environ.get("LOBSTER_QUANT_CHANNEL", "telegram")
         )
-    channels = _normalize_notify_channels(
-        {"notify_channels": notify_channels}
-        if notify_channels is not None else
-        cfg["monitor"]
-    )
     cfg["monitor"]["notify_channels"] = channels
     cfg["monitor"]["notify_channel"] = channels[0] if channels else ""
 
@@ -383,16 +449,28 @@ def monitor_set(enabled, mode=None, source_channel=None, notify_channels=None):
 
 
 def monitor_status():
-    cfg = load_watchlist_config()
+    try:
+        cfg = load_watchlist_config()
+    except Exception:
+        return {"ok": False, "blocked": True, "monitor": {},
+                "state_health": {"ok": False, "blocked": True, "code": "notification_config_unavailable",
+                                 "message": "盯盘配置不可用，请保留原文件并检查配置。"},
+                "trading_time": trading_time_status()}
+    state_health = {"ok": True, "blocked": False}
     strategy = cfg.get("strategy_monitor", {}) or {}
     try:
         runtime_state = load_monitor_state()
         runtime_unavailable = runtime_state.get("strategy_last_unavailable", [])
-    except Exception:
-        runtime_state = {}
-        runtime_unavailable = []
+    except MonitorStateBlocked as exc:
+        runtime_state, runtime_unavailable = {}, []
+        state_health = exc.as_status()
+    delivery = monitor_delivery_status()
+    blocked = bool(state_health.get("blocked") or delivery.get("blocked"))
     return {
-        "ok": True,
+        "ok": not blocked,
+        "blocked": blocked,
+        "state_health": state_health,
+        "delivery": delivery,
         "monitor": cfg.get("monitor", _default_watchlist_config()["monitor"]),
         "trading_time": trading_time_status(),
         "watch_pool_count": len(cfg.get("watch_pool", [])),
@@ -411,6 +489,7 @@ def monitor_status():
             "runtime_unavailable": runtime_unavailable
         }
     }
+
 
 
 def _monitor_status_with_runtime():
@@ -457,7 +536,10 @@ def format_monitor_status_summary(status):
     targets = monitor.get("targets") or []
     target_text = "、".join(_monitor_target_name(item) for item in targets) or "无"
     source_channel = _normalize_channel_name(monitor.get("source_channel"))
-    notify_channels = _normalize_notify_channels(monitor)
+    try:
+        notify_channels = _normalize_notify_channels(monitor, include_fallback=False)
+    except ValueError:
+        notify_channels = []
     channel_display = {
         "weixin": "微信",
         "telegram": "Telegram",
@@ -483,9 +565,10 @@ def format_monitor_status_summary(status):
         f"- 是否只在交易时段运行：{'是' if monitor.get('market_hours_only') else '否'}",
         f"- 当前交易状态：{trading.get('message') or '-'}",
         (
-            f"- 预计恢复扫描：{trading.get('next_open')}（按工作日规则）"
+            f"- 预计恢复扫描：{trading.get('next_open')}（按已收录交易所日历，临时停市须另行核实）"
             if not trading.get("is_trading_time") and trading.get("next_open")
-            else "- 预计恢复扫描：当前已在交易时段"
+            else "- 预计恢复扫描：当前已在交易时段" if trading.get("is_trading_time")
+            else "- 预计恢复扫描：未知，需更新交易所日历后再核实"
         ),
         "",
         "二、盯盘模式",
@@ -515,7 +598,11 @@ def format_monitor_status_summary(status):
         ),
         "- 以上后台进程状态来自 PID、进程身份和运行锁的联合检查。",
     ]
+    warnings = _monitor_health_lines(status)
+    if warnings:
+        lines[1:1] = ["", *warnings, ""]
     return "\n".join(lines)
+
 
 
 def monitor_status_output(text=""):
@@ -588,216 +675,257 @@ def _strategy_targets_from_text(text):
     return targets or ["holding_pool"]
 
 
+def _strategy_side_label(side):
+    return {"buy": "买入", "sell": "卖出"}.get(side, "条件")
+
+
+def _strategy_condition_summary(condition):
+    """Describe the executable DSL, rather than repeating the unparsed request."""
+    timeframe = condition.get("timeframe_minutes", 1)
+    frame = "日线" if timeframe == 1440 else f"{timeframe}分钟"
+    kind = condition.get("type")
+    operator = condition.get("operator", ">=")
+    if kind in {"macd_cross", "kdj_cross"}:
+        indicator = "MACD" if kind == "macd_cross" else "KDJ"
+        direction = "金叉" if condition.get("direction") == "golden_cross" else "死叉"
+        return f"{frame}{indicator}{direction}"
+    if kind == "indicator_threshold":
+        return f"{frame}{condition.get('indicator', '').upper()}{operator}{condition.get('value'):g}"
+    if kind == "price_vs_ma":
+        return f"{frame}最新收盘价{operator}MA{condition.get('period')}"
+    if kind == "volume_vs_average":
+        current = "当日累计成交量" if timeframe == 1440 else f"当前{frame}成交量"
+        return f"{current}{operator}前{condition.get('lookback')}根{frame}均量×{condition.get('factor'):g}"
+    if kind == "order_book_strength":
+        ratio = "卖盘/买盘" if condition.get("direction") == "sell" else "买盘/卖盘"
+        return f"五档{ratio}{operator}{condition.get('min_ratio'):g}倍"
+    if kind == "quote_threshold":
+        names = {"price": "实时价格", "change_percent": "当日涨跌幅", "volume_ratio": "实时量比",
+                 "turnover_rate_percent": "换手率", "amplitude_percent": "振幅"}
+        field = condition.get("field")
+        unit = "%" if field in {"change_percent", "turnover_rate_percent", "amplitude_percent"} else "元" if field == "price" else ""
+        return f"{names.get(field, field)}{operator}{condition.get('value'):g}{unit}"
+    return str(kind)
+
+
+def _strategy_rule_summary(rule, targets=None):
+    scope = rule.get("code") or "、".join(_monitor_target_name(target) for target in (targets or ["holding_pool"]))
+    logic = "任意一个" if rule.get("logic") == "any" else "全部"
+    conditions = "；".join(_strategy_condition_summary(item) for item in rule.get("conditions", []))
+    return f"{scope}：满足{logic}条件时发出{_strategy_side_label(rule.get('side'))}提醒（{conditions}）。仅提醒，不自动交易。"
+
+
+def _parse_strategy_atom(clause):
+    """Parse one complete condition. Never accept a recognized substring alone."""
+    number = r"-?(?:\d+(?:\.\d+)?|\.\d+)"
+    comparator = r">=|<=|>|<|=="
+    frame_pattern = r"(?:(?:\d+|一|三|五)分钟|日线)"
+    warnings = []
+    clause = re.sub(rf"^(MACD|KDJ|RSI)({frame_pattern})", r"\2\1", clause, flags=re.I)
+    frame_match = re.match(rf"^({frame_pattern})", clause)
+    frame_text = frame_match.group(1) if frame_match else None
+    atom = clause[frame_match.end():] if frame_match else clause
+    if frame_text == "日线":
+        timeframe = 1440
+    elif frame_text:
+        frame_number = frame_text[:-2]
+        timeframe = {"一": 1, "三": 3, "五": 5}.get(frame_number)
+        if timeframe is None:
+            timeframe = int(frame_number)
+    else:
+        timeframe = 1
+    if timeframe not in {1, 3, 5, 1440}:
+        return None, [], "指标周期仅支持1、3、5分钟或日线，不能自动替换周期"
+
+    cross = re.fullmatch(r"(MACD|KDJ)(?:出现|形成|发生)?(金叉|死叉)", atom, re.I)
+    if cross:
+        if not frame_text:
+            warnings.append("未指定指标周期，按1分钟计算")
+        return {"type": cross.group(1).lower() + "_cross", "timeframe_minutes": timeframe,
+                "direction": "golden_cross" if cross.group(2) == "金叉" else "death_cross"}, warnings, None
+
+    rsi = re.fullmatch(rf"RSI({comparator})({number})", atom, re.I)
+    if rsi:
+        value = float(rsi.group(2))
+        if not 0 <= value <= 100:
+            return None, [], "RSI阈值必须在0到100之间"
+        if not frame_text:
+            warnings.append("未指定指标周期，按1分钟计算")
+        warnings.append("RSI使用固定14期算法")
+        return {"type": "indicator_threshold", "indicator": "rsi", "timeframe_minutes": timeframe,
+                "operator": rsi.group(1), "value": value}, warnings, None
+
+    ma = re.fullmatch(rf"(?:价格|股价|现价)?({comparator})(?:MA(\d+)|(\d+)(日)?均线)", atom, re.I)
+    if ma:
+        period = int(ma.group(2) or ma.group(3))
+        if period not in {5, 10, 20, 30, 60}:
+            return None, [], "MA周期仅支持5、10、20、30、60，不能静默改成其他周期"
+        if ma.group(4):
+            if frame_text and timeframe != 1440:
+                return None, [], "分钟周期与日均线冲突，请明确使用日线MA还是分钟MA"
+            timeframe = 1440
+        elif not frame_text:
+            warnings.append("未指定均线K线周期，按1分钟计算")
+        return {"type": "price_vs_ma", "timeframe_minutes": timeframe, "period": period,
+                "operator": ma.group(1)}, warnings, None
+
+    volume = re.fullmatch(rf"成交量({comparator})(?:过去|近)(\d+)(天|日|分钟|根)(?:平均成交量|均量)(?:的)?({number})倍", atom)
+    if volume:
+        lookback, unit, factor = int(volume.group(2)), volume.group(3), float(volume.group(4))
+        if not 1 <= lookback <= 30 or not math.isfinite(factor) or factor <= 0:
+            return None, [], "成交量均量窗口需为1到30，倍数需为正数"
+        if unit in {"天", "日"}:
+            if frame_text and timeframe != 1440:
+                return None, [], "当前分钟成交量与日均量口径不同，请明确日线或分钟线"
+            timeframe = 1440
+            warnings.append("日成交量为当日累计量，对比此前完整交易日均量，不是同一时刻均量")
+        elif unit == "分钟" and timeframe != 1:
+            return None, [], "分钟均量窗口与K线周期不一致；请改用明确的前N根均量"
+        elif not frame_text:
+            warnings.append("未指定成交量K线周期，按1分钟计算")
+        return {"type": "volume_vs_average", "timeframe_minutes": timeframe, "lookback": lookback,
+                "operator": volume.group(1), "factor": factor}, warnings, None
+
+    book = re.fullmatch(rf"(买|卖)盘(?:明显)?强于(卖|买)盘(?:的)?({number})倍", atom)
+    if book and book.group(1) != book.group(2):
+        if frame_text:
+            return None, [], "五档盘口是实时快照，不支持指定K线周期"
+        factor = float(book.group(3))
+        if not math.isfinite(factor) or factor < 1:
+            return None, [], "盘口强于条件的倍数需大于等于1"
+        return {"type": "order_book_strength", "direction": "buy" if book.group(1) == "买" else "sell",
+                "operator": ">", "min_ratio": factor}, warnings, None
+
+    quote = re.fullmatch(rf"((?:单日|当日)?(?:涨跌幅|涨幅|跌幅)|价格|股价|现价|量比|换手率|振幅)({comparator})({number})(%|元)?", atom)
+    if quote:
+        if frame_text:
+            return None, [], "价格、涨跌幅和盘口字段使用实时快照；指定分钟或日线收盘条件暂不支持"
+        field_text, operator, value, unit = quote.group(1), quote.group(2), float(quote.group(3)), quote.group(4)
+        if not math.isfinite(value):
+            return None, [], "阈值必须为有限数值"
+        field_text = re.sub(r"^(?:单日|当日)", "", field_text)
+        field = {"价格": "price", "股价": "price", "现价": "price", "量比": "volume_ratio",
+                 "换手率": "turnover_rate_percent", "振幅": "amplitude_percent",
+                 "涨跌幅": "change_percent", "涨幅": "change_percent", "跌幅": "change_percent"}[field_text]
+        percent = field in {"change_percent", "turnover_rate_percent", "amplitude_percent"}
+        if (unit == "%" and not percent) or (unit == "元" and field != "price"):
+            return None, [], "阈值单位与字段不一致"
+        if field != "change_percent" and value < 0 or field == "price" and value <= 0:
+            return None, [], "价格需为正数，量比、换手率和振幅不能为负数"
+        if field_text == "跌幅":
+            if value < 0:
+                return None, [], "跌幅请使用正数百分比，例如跌幅超过3%"
+            value = -value
+            operator = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "==": "=="}[operator]
+        if percent and not unit:
+            warnings.append("百分比字段未写%，按百分点解释")
+        return {"type": "quote_threshold", "field": field, "operator": operator, "value": value}, warnings, None
+
+    if "放量" in atom or "占优" in atom or "明显" in atom:
+        return None, [], "定性条件需要数值定义；请写明均量窗口、倍数或盘口比例"
+    if any(term in atom for term in ("突破", "跌破", "站上", "上穿", "下穿")):
+        return None, [], "穿越事件不能替换成当前高于/低于；请明确改用阈值状态，或使用MACD/KDJ金叉死叉"
+    return None, [], f"无法识别条件片段：{clause}；请补充支持的指标、方向及阈值，不会忽略未识别文字"
+
+
 def parse_strategy_text(text):
     raw = " ".join(str(text or "").strip().split())
+
+    def reject(message):
+        return {"ok": False, "error": "策略包含无法识别或不完整的条件，未生成可执行配置",
+                "rules": [], "unavailable_conditions": [message], "needs_clarification": True}
+
     if not raw:
-        return {
-            "ok": False,
-            "error": "策略内容为空",
-            "rules": [],
-            "unavailable_conditions": []
-        }
+        return reject("策略内容为空")
+    if len(raw) > 2000:
+        return reject("策略内容过长，请拆成较短的独立策略")
+    compact = re.sub(r"\s+", "", raw).translate(str.maketrans({"％": "%", "＞": ">", "＜": "<", "＝": "=", "≥": ">=", "≤": "<="}))
+    # Normalize complete comparison phrases before splitting boolean connectors.
+    operators = [("大于或等于", ">="), ("小于或等于", "<="), ("大于等于", ">="), ("小于等于", "<="),
+                 ("不低于", ">="), ("不小于", ">="), ("不少于", ">="), ("不高于", "<="), ("不大于", "<="), ("不超过", "<="),
+                 ("至少", ">="), ("至多", "<="), ("达到", ">="), ("涨到", ">="), ("跌到", "<="),
+                 ("超过", ">"), ("高于", ">"), ("大于", ">"), ("低于", "<"), ("小于", "<"), ("等于", "==")]
+    for phrase, symbol in operators:
+        compact = compact.replace(phrase, symbol)
+    compact = re.sub(r"(?<![<>=])=(?!=)", "==", compact)
+    if re.search(r"[()（）]|\bNOT\b|不要|不能|不满足|没有|未出现|不是|除非|否则", compact, re.I):
+        return reject("括号分组、否定或例外条件暂不支持，请拆分并明确每条条件；不会忽略这些限制")
+    if any(term in compact for term in ("持续", "连续", "先", "再", "之后", "之前", "收盘后", "分钟内", "只提醒一次")):
+        return reject("持续时间、先后顺序或提醒次数限制暂不支持，不能当作即时阈值执行")
 
-    code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", raw)
-    code = code_match.group(1) if code_match else None
-    side = "sell" if any(x in raw for x in ("卖出", "止损", "减仓", "离场")) else "buy"
-    conditions = []
-    unavailable = []
+    # Only consume a complete trailing notification action, never terms inside a condition.
+    action = re.search(r"(?:的时候|时候|时|后)?[，,]?(?:就|则)?(?:请)?(?:自动)?提醒(?:我)?(?:(买入|加仓|卖出|止损|减仓|离场)(?:信号)?|(?:一下|通知|信号))?[。！!]*$", compact)
+    side = "alert"
+    if action:
+        side = "sell" if action.group(1) in {"卖出", "止损", "减仓", "离场"} else "buy" if action.group(1) in {"买入", "加仓"} else "alert"
+        compact = compact[:action.start()]
+    else:
+        compact = compact.rstrip("。")
+    compact = re.sub(r"^(?:(?:请|帮我|帮忙|如果|若|当|对|监控|盯住|盯着))+", "", compact)
 
-    if "MACD" in raw.upper():
-        timeframe = _strategy_timeframe(raw, "MACD")
-        direction = "golden_cross" if "金叉" in raw else "death_cross" if "死叉" in raw else None
-        if direction:
-            conditions.append({
-                "type": "macd_cross",
-                "timeframe_minutes": timeframe,
-                "direction": direction
-            })
+    pools = {"持仓池": "holding_pool", "持仓股": "holding_pool", "持仓": "holding_pool",
+             "观察池": "watch_pool", "自选池": "watch_pool", "关注池": "watch_pool"}
+    pool_names = "|".join(pools)
+    pool_match = re.match(rf"^((?:{pool_names})(?:(?:和|与|、|以及|及)(?:{pool_names}))*)", compact)
+    codes = []
+    warnings = []
+    if pool_match:
+        targets = list(dict.fromkeys(pools[item] for item in re.findall(pool_names, pool_match.group(1))))
+        compact = compact[pool_match.end():]
+        scope = "pools"
+    else:
+        code_match = re.match(r"^(?:股票|标的)?(\d{6}(?:(?:和|与|、|,|，|以及|及)\d{6})*)(?=\d+分钟|\D|$)", compact)
+        if code_match:
+            codes = list(dict.fromkeys(re.findall(r"\d{6}", code_match.group(1))))
+            compact = compact[code_match.end():]
+            targets = []
+            scope = "explicit_symbols"
         else:
-            unavailable.append("MACD 条件需要明确“金叉”或“死叉”")
+            targets, scope = ["holding_pool"], "pools"
+            warnings.append("未指定标的或股票池，按持仓池执行")
+    compact = re.sub(r"^(?:里的|中的|的)?(?:所有股票|所有标的|股票|标的)?(?:都|均)?[：:]?", "", compact)
+    if re.search(r"(?<!\d)\d{6}(?!\d)", compact) or re.search(pool_names, compact):
+        return reject("多个标的必须共用同一组条件，例如“510050、510300价格高于3元”；分别设置不同条件请分开解析，股票池与代码范围不能混用")
+    if any(char in compact for char in ("；", ";")):
+        return reject("多条独立策略请分开解析；不支持用分号合并不同条件或动作")
 
-    daily_volume_match = re.search(
-        r"成交量.*?(?:过去|近)\s*(\d+)\s*(?:天|日).*?均量(?:的)?\s*([0-9.]+)\s*倍",
-        raw
-    )
-    minute_volume_match = re.search(
-        r"成交量.*?(?:过去|近)?\s*(\d+)\s*分钟.*?均量(?:的)?\s*([0-9.]+)\s*倍",
-        raw
-    )
-    if daily_volume_match:
-        conditions.append({
-            "type": "volume_vs_average",
-            "timeframe_minutes": 1440,
-            "lookback": int(daily_volume_match.group(1)),
-            "operator": ">=",
-            "factor": float(daily_volume_match.group(2))
-        })
-    elif minute_volume_match:
-        conditions.append({
-            "type": "volume_vs_average",
-            "timeframe_minutes": 1,
-            "lookback": int(minute_volume_match.group(1)),
-            "operator": ">=",
-            "factor": float(minute_volume_match.group(2))
-        })
-    elif "放量" in raw:
-        timeframe = _strategy_timeframe(raw, "成交量")
-        conditions.append({
-            "type": "volume_vs_average",
-            "timeframe_minutes": timeframe,
-            "lookback": 5,
-            "operator": ">=",
-            "factor": 1.5
-        })
-
-    if any(x in raw for x in ("买盘明显强于卖盘", "买盘强于卖盘", "买盘占优")):
-        factor = _strategy_number(r"买盘.*?卖盘\s*([0-9.]+)\s*倍", raw, 1.2)
-        conditions.append({
-            "type": "order_book_strength",
-            "direction": "buy",
-            "min_ratio": factor
-        })
-    if any(x in raw for x in ("卖盘明显强于买盘", "卖盘强于买盘", "卖盘占优")):
-        factor = _strategy_number(r"卖盘.*?买盘\s*([0-9.]+)\s*倍", raw, 1.2)
-        conditions.append({
-            "type": "order_book_strength",
-            "direction": "sell",
-            "min_ratio": factor
-        })
-
-    rsi_match = re.search(r"RSI\s*(?:超过|高于|大于|低于|小于)\s*([0-9.]+)", raw, re.IGNORECASE)
-    if rsi_match:
-        timeframe = _strategy_timeframe(raw, "RSI")
-        threshold = float(rsi_match.group(1))
-        operator = "<" if any(x in raw[rsi_match.start():rsi_match.end()] for x in ("低于", "小于")) else ">"
-        conditions.append({
-            "type": "indicator_threshold",
-            "indicator": "rsi",
-            "timeframe_minutes": timeframe,
-            "operator": operator,
-            "value": threshold
-        })
-
-    if "KDJ" in raw.upper():
-        timeframe = _strategy_timeframe(raw, "KDJ")
-        direction = "golden_cross" if "金叉" in raw else "death_cross" if "死叉" in raw else None
-        if direction:
-            conditions.append({
-                "type": "kdj_cross",
-                "timeframe_minutes": timeframe,
-                "direction": direction
-            })
-
-    ma_match = re.search(r"(?:站上|突破|高于|跌破|低于)\s*(?:MA)?\s*(\d+)\s*(?:日|分钟)?均线", raw, re.IGNORECASE)
-    if ma_match:
-        timeframe = _strategy_timeframe(raw, "均线")
-        conditions.append({
-            "type": "price_vs_ma",
-            "timeframe_minutes": timeframe,
-            "period": int(ma_match.group(1)),
-            "operator": "<" if any(x in raw[ma_match.start():ma_match.end()] for x in ("跌破", "低于")) else ">"
-        })
-
-    ratio_match = re.search(r"量比\s*(?:超过|高于|大于|低于|小于)\s*([0-9.]+)", raw)
-    if ratio_match:
-        conditions.append({
-            "type": "quote_threshold",
-            "field": "volume_ratio",
-            "operator": "<" if any(x in raw[ratio_match.start():ratio_match.end()] for x in ("低于", "小于")) else ">",
-            "value": float(ratio_match.group(1))
-        })
-
-    turnover_match = re.search(r"换手率\s*(?:超过|高于|大于|低于|小于)\s*([0-9.]+)\s*%?", raw)
-    if turnover_match:
-        conditions.append({
-            "type": "quote_threshold",
-            "field": "turnover_rate_percent",
-            "operator": "<" if any(x in raw[turnover_match.start():turnover_match.end()] for x in ("低于", "小于")) else ">",
-            "value": float(turnover_match.group(1))
-        })
-
-    amplitude_match = re.search(r"振幅\s*(?:超过|高于|大于|低于|小于)\s*([0-9.]+)\s*%?", raw)
-    if amplitude_match:
-        conditions.append({
-            "type": "quote_threshold",
-            "field": "amplitude_percent",
-            "operator": "<" if any(x in raw[amplitude_match.start():amplitude_match.end()] for x in ("低于", "小于")) else ">",
-            "value": float(amplitude_match.group(1))
-        })
-
-    pct_match = re.search(
-        r"(?:单日|当日)?(?:涨跌幅|涨幅)\s*(?:超过|高于|大于|低于|小于)\s*(-?[0-9.]+)\s*%?",
-        raw
-    )
-    if pct_match:
-        conditions.append({
-            "type": "quote_threshold",
-            "field": "change_percent",
-            "operator": "<" if any(x in raw[pct_match.start():pct_match.end()] for x in ("低于", "小于")) else ">",
-            "value": float(pct_match.group(1))
-        })
-
-    price_match = re.search(
-        r"(?:价格|股价|现价)\s*(?:超过|高于|大于|低于|小于|跌破|突破)\s*([0-9.]+)(?!\s*(?:日|分钟)?均线)",
-        raw
-    )
-    if price_match:
-        conditions.append({
-            "type": "quote_threshold",
-            "field": "price",
-            "operator": "<" if any(x in raw[price_match.start():price_match.end()] for x in ("低于", "小于", "跌破")) else ">",
-            "value": float(price_match.group(1))
-        })
-
-    known_terms = ("MACD", "成交量", "放量", "买盘", "卖盘", "RSI", "KDJ", "均线", "量比", "换手率", "振幅", "涨跌幅", "价格", "股价", "现价")
-    clauses = re.split(r"并且|同时|而且|以及|或者|(?<!如)或", raw)
-    if len(clauses) > 1:
-        harmless = re.compile(
-            r"如果|当|则|就|请|我|提醒|自动|触发|信号|条件|策略|盯盘|"
-            r"买入|卖出|止损|减仓|离场|持仓池|观察池|关注池|自选池|"
-            r"股票|标的|分钟|日线|时候|时|后|的|和|[0-9.%：:,，。\s]"
-        )
-        for clause in clauses:
-            if any(term.lower() in clause.lower() for term in known_terms):
-                continue
-            residue = harmless.sub("", clause)
-            if residue:
-                unavailable.append(f"无法识别条件片段：{clause.strip()}")
-    if not conditions and any(term.lower() in raw.lower() for term in known_terms):
-        unavailable.append("未能把策略条件解析成可执行规则，请补充明确的方向、阈值或周期")
-    if not conditions:
-        return {
-            "ok": False,
-            "error": "没有识别到可执行条件",
-            "rules": [],
-            "unavailable_conditions": unavailable
-        }
-
-    if unavailable:
-        return {
-            "ok": False,
-            "error": "策略包含无法识别或不完整的条件，未生成可执行配置",
-            "rules": [],
-            "unavailable_conditions": unavailable,
-        }
-
-    rule = {
-        "id": hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12],
-        "code": code,
-        "side": side,
-        "logic": "any" if re.search(r"或者|(?<!如)或", raw) else "all",
-        "conditions": conditions,
-        "raw_text": raw
-    }
-    return {
-        "ok": True,
-        "schema_version": "strategy-dsl/v1",
-        "operation": "upsert",
-        "rules": [rule],
-        "targets": _strategy_targets_from_text(raw),
-        "unavailable_conditions": unavailable
-    }
-
+    connector_pattern = r"并且|而且|同时|以及|或者|\&\&|\|\||(?i:AND|OR)|且|并|和|与|或|[，,]"
+    parts = re.split(f"({connector_pattern})", compact)
+    clauses, connectors = parts[::2], parts[1::2]
+    logic_set = {"any" if item.upper() in {"OR", "或", "或者", "||"} else "all" for item in connectors}
+    if len(logic_set) > 1:
+        return reject("同时使用“并且”和“或者”时逻辑范围有歧义，请拆分规则；不会把所有条件改成“或者”")
+    if any(not clause for clause in clauses):
+        return reject("条件连接词前后缺少完整条件")
+    conditions = []
+    previous_clause = None
+    for clause in clauses:
+        # A complete bare threshold can inherit only its immediately preceding
+        # threshold subject. Reparse it so unit/range checks remain authoritative.
+        if (
+            previous_clause is not None
+            and conditions[-1].get("type") in {"quote_threshold", "indicator_threshold"}
+            and re.fullmatch(r"(?:>=|<=|>|<|==)-?(?:\d+(?:\.\d+)?|\.\d+)(?:%|元)?", clause)
+        ):
+            subject = re.split(r">=|<=|>|<|==", previous_clause, maxsplit=1)[0]
+            clause = subject + clause
+        condition, atom_warnings, error = _parse_strategy_atom(clause)
+        if error:
+            return reject(error)
+        conditions.append(condition)
+        warnings.extend(atom_warnings)
+        previous_clause = clause
+    if any(item.get("timeframe_minutes", 1) != 1 for item in conditions) and any("按1分钟" in item for item in warnings):
+        return reject("组合条件的K线周期作用范围不明确，请分别写明每个指标的周期")
+    rules = []
+    for code in codes or [None]:
+        rule = {"id": hashlib.sha1((raw + (":" + code if len(codes) > 1 else "")).encode("utf-8")).hexdigest()[:12],
+                "code": code, "scope": scope, "side": side, "logic": next(iter(logic_set), "all"),
+                "conditions": [dict(item) for item in conditions], "raw_text": raw}
+        rules.append(rule)
+    return {"ok": True, "schema_version": "strategy-dsl/v1", "operation": "replace", "rules": rules,
+            "targets": targets, "unavailable_conditions": [], "warnings": list(dict.fromkeys(warnings)),
+            "confirmation": [_strategy_rule_summary(rule, targets) for rule in rules]}
 
 def _strategy_payload_from_parse(text, parsed):
     return {
@@ -860,6 +988,8 @@ def strategy_dry_run(text):
         "dry_run": True,
         "parse_result": parsed,
         "draft": draft,
+        "confirmation": parsed.get("confirmation", []),
+        "warnings": parsed.get("warnings", []),
         "write_result": {"ok": False, "skipped": True, "reason": "dry-run"},
         "reload_result": {"ok": False, "skipped": True, "reason": "dry-run"},
         "effective_status": {"effective": False, "reason": "尚未写入配置"},
@@ -932,6 +1062,8 @@ def strategy_set(text):
         "effective_status": effective,
         "verification_result": verification,
         "strategy": reloaded,
+        "confirmation": parsed.get("confirmation", []),
+        "warnings": parsed.get("warnings", []),
         "capabilities": strategy_capabilities(),
     }
 
@@ -988,11 +1120,7 @@ def strategy_explain(rule_id):
         "targets": strategy.get("targets", []),
         "conditions": rule.get("conditions", []),
         "raw_text": rule.get("raw_text"),
-        "explanation": (
-            f"对{rule.get('code') or '目标池标的'}按 {str(rule.get('logic', 'all')).upper()} "
-            f"判断 {len(rule.get('conditions', []))} 个条件，满足后生成"
-            f"{'买入' if rule.get('side') == 'buy' else '卖出'}提醒。"
-        ),
+        "explanation": _strategy_rule_summary(rule, strategy.get("targets")),
     }
 
 
@@ -1087,12 +1215,17 @@ def _parse_natural_backtest_request(text):
             "ok": False,
             "error": "请在回测指令中提供六位股票或ETF代码，例如：回测510050最近60天。"
         }
+    symbols = set(re.findall(r"(?<!\d)(\d{6})(?!\d)", raw))
+    if len(symbols) != 1:
+        return {"ok": False, "error": "每次回测请只指定一个证券代码。"}
     days_match = re.search(r"(?:最近|周期)\s*(\d+)\s*天", raw)
-    interval = "1d"
-    if "1分钟" in raw or "一分钟" in raw:
-        interval = "1m"
-    elif "5分钟" in raw or "五分钟" in raw:
-        interval = "5m"
+    if days_match and int(days_match.group(1)) <= 0:
+        return {"ok": False, "error": "回测天数必须大于零。"}
+    intervals = re.findall(r"(\d+|一|五|十五|三十|六十)\s*分钟", raw)
+    intervals = [{"一": "1", "五": "5"}.get(item, item) for item in intervals]
+    if any(item not in {"1", "5"} for item in intervals) or len(set(intervals)) > 1:
+        return {"ok": False, "error": "回测仅支持 1 分钟、5 分钟或日线；不支持混合周期。"}
+    interval = intervals[0] + "m" if intervals else "1d"
     return {
         "ok": True,
         "symbol": code_match.group(1),
@@ -1112,13 +1245,13 @@ def backtest_run_text_command(text):
     if not parsed.get("ok"):
         return parsed
 
-    set_strategy(parsed)
     result = run_backtest(
         symbol=request["symbol"],
         days=request["days"],
         interval=request["interval"],
         strategy_override=parsed,
     )
+    set_strategy(parsed)
     result["条件识别结果"] = {
         "买入条件": parsed["buy_conditions"],
         "卖出条件": parsed["sell_conditions"],
@@ -1215,6 +1348,8 @@ def _format_backtest_review(result):
         if forced_count else
         "本次没有回测结束强制平仓。"
     )
+    if result.get("open_position"):
+        lines.append("期末仍有未平仓持仓，收益包含浮动估值；胜率只统计已完成交易。")
     return lines
 
 
@@ -1288,6 +1423,12 @@ def format_backtest_run_text_result(result, original_text):
         "",
         *_format_backtest_review(result),
     ])
+    assumptions = result.get("execution_assumptions", {})
+    if assumptions:
+        lines.extend(["", "六、成交与数据假设", assumptions.get("signal_timing", ""), assumptions.get("settlement", "")])
+        lines.extend(f"- {item}" for item in assumptions.get("limitations", []))
+    if result.get("cache_stale"):
+        lines.append("- 当前使用过期缓存，请先核验数据时间。")
     return "\n".join(lines)
 
 
@@ -1388,6 +1529,8 @@ def _parse_backtest_cli_args(args):
         raise ValueError(f"无法识别的回测参数：{token}")
     if options["interval"] not in {"1m", "5m", "1d"}:
         raise ValueError("回测 interval 仅支持 1m、5m、1d")
+    if options["days"] <= 0:
+        raise ValueError("回测天数必须为正整数")
     return options
 
 
@@ -1398,6 +1541,105 @@ MODEL_FALLBACK_CANDIDATES = [
     if item.strip()
 ]
 MODEL_FALLBACK_LOG_PATH = _state_path("model_fallback.log")
+
+
+def _load_model_traffic_controller():
+    """The optional local controller is the sole owner of traffic-switch state."""
+    try:
+        return importlib.import_module("model_traffic_control")
+    except ModuleNotFoundError as exc:
+        if exc.name == "model_traffic_control":
+            return None
+        raise
+
+
+def _model_route_snapshot():
+    """Read once per request; a broken installed controller must never go legacy."""
+    try:
+        controller = _load_model_traffic_controller()
+        if controller is None:
+            return {"ok": True, "installed": False, "mode": "legacy"}
+        result = controller.route_for_request()
+        if not isinstance(result, dict) or not isinstance(result.get("installed"), bool):
+            raise ValueError("invalid controller response")
+        if result["installed"] is False and result.get("ok") is True:
+            return {"ok": True, "installed": False, "mode": "legacy"}
+        route = {key: result.get(key) for key in ("ok", "installed", "mode", "selected_model", "error", "config_path")}
+        if route.get("ok") is not True:
+            route["ok"] = False
+            route["selected_model"] = None
+            return route
+        # The controller validates policy/provider consistency and owns model ids.
+        # Do not duplicate its on/off mapping here; retain only a safe API shape.
+        selected = route.get("selected_model")
+        if route.get("mode") not in {"on", "off"} or not isinstance(selected, str) or not re.fullmatch(r"[^\s/]+/[^\s]+", selected):
+            raise ValueError("invalid selected route")
+        if not isinstance(route.get("config_path"), str) or not os.path.isabs(route["config_path"]):
+            raise ValueError("missing controlled config path")
+        try:
+            _model_subprocess_options(route)
+        except Exception:
+            return {"ok": False, "installed": True, "mode": "blocked", "selected_model": None,
+                    "error": "controlled_environment_unavailable"}
+        return route
+    except Exception:
+        return {"ok": False, "installed": True, "mode": "blocked", "selected_model": None,
+                "error": "controller_unavailable"}
+
+
+def _model_subprocess_options(route=None):
+    if not route or not route.get("installed"):
+        return {}
+    # Bind both discovery and inference to the same config the controller checked.
+    # A separate environment leaves other requests and the parent process intact.
+    adapter = importlib.import_module("model_traffic_adapter")
+    return {"env": adapter.controlled_subprocess_env(route["config_path"])}
+
+
+def _model_route_error(route):
+    return {"ok": False, "error_type": "traffic_policy_blocked",
+            "message": "模型流量开关状态不可用或与网关配置不一致，本次未发起模型请求；请检查 model codex status。",
+            "routing": {key: value for key, value in route.items() if key != "config_path"},
+            "attempts": [], "models": []}
+
+
+def model_codex_control(action="status"):
+    action = str(action).strip().lower()
+    if action not in {"on", "off", "status"}:
+        return {"ok": False, "error": "用法：model codex on|off|status"}
+    try:
+        controller = _load_model_traffic_controller()
+        if controller is None:
+            return {"ok": action == "status", "installed": False, "mode": "legacy",
+                    "configured_primary_model": MODEL_PRIMARY or None,
+                    "configured_fallback_models": list(MODEL_FALLBACK_CANDIDATES),
+                    "message": "未安装 Codex 流量控制器；模型请求沿用原有 OpenClaw／插件配置。",
+                    "model_request_sent": False}
+        result = controller.get_status() if action == "status" else controller.set_mode(action)
+        if not isinstance(result, dict) or not isinstance(result.get("installed"), bool):
+            raise ValueError("invalid controller response")
+        if result["installed"] is False:
+            result = {**result, "routing_mode": "legacy",
+                      "message": "Codex 流量开关尚未初始化；模型请求沿用原有 OpenClaw／插件配置。"}
+        return {**result, "model_request_sent": False}
+    except Exception:
+        return {"ok": False, "installed": True, "mode": "blocked", "selected_model": None,
+                "error": "controller_unavailable", "model_request_sent": False,
+                "message": "Codex 流量控制器不可用；未切换到其他模型。"}
+
+
+def _dispatch_model_command(args):
+    action = str(args[0]).strip().lower() if args else "status"
+    if action == "status" and len(args) <= 1:
+        return model_codex_control("status")
+    if action == "codex" and len(args) == 2:
+        return model_codex_control(args[1])
+    if action == "ping" and len(args) == 1:
+        return model_ping()
+    if action in {"ask", "run"}:
+        prompt = " ".join(args[1:]).strip()
+        return model_call_with_fallback(prompt) if prompt else {"ok": False, "error": "用法：model ask \"需要模型处理的文本\""}
+    return {"ok": False, "error": "用法：model [status|codex on|codex off|codex status|ping|ask 文本]"}
 
 
 def _classify_model_error(text):
@@ -1413,6 +1655,7 @@ def _classify_model_error(text):
         ("server_error", ("500",)),
         ("empty_response", ("no response generated", "empty response", "空响应")),
         ("session_conflict", ("sessiontakeover", "session file changed")),
+        ("unsupported_cli", ("unknown command", "unknown option")),
     ]
     for error_type, needles in patterns:
         if any(needle in lowered for needle in needles):
@@ -1421,12 +1664,9 @@ def _classify_model_error(text):
 
 
 def _model_request_id(text):
-    matches = re.findall(
-        r"(?:request[\s_-]*id\s*[:：]\s*|\b)([A-Za-z0-9:_-]{12,})",
-        str(text or ""),
-        re.IGNORECASE
-    )
-    return matches[-1] if matches else None
+    # No independently trusted structured request-id field is exposed here.
+    # Error text may contain credentials, even when labelled as a request id.
+    return None
 
 
 def _model_error_summary(error_type):
@@ -1443,47 +1683,93 @@ def _model_error_summary(error_type):
         "session_conflict": "模型探测会话发生冲突",
         "json_parse_error": "模型响应格式无法解析",
         "not_configured": "模型未配置或不在允许列表",
+        "unsupported_cli": "当前 OpenClaw 不支持 infer model run；请升级后使用辅助模型功能，其他研究功能不受影响",
+        "discovery_failed": "无法读取当前 OpenClaw 模型列表；请检查 Gateway 状态后重试",
+        "cli_unavailable": "无法启动 OpenClaw 命令，请检查安装和 PATH",
         "unknown_error": "模型调用失败",
     }.get(error_type, "模型调用失败")
 
 
-def _configured_model_keys():
+def _configured_model_metadata(timeout_seconds=20, route=None):
     try:
         result = subprocess.run(
             ["openclaw", "models", "list", "--json"],
             capture_output=True,
             text=True,
-            timeout=20,
-            check=False
+            timeout=timeout_seconds,
+            check=False,
+            **_model_subprocess_options(route),
         )
+        if result.returncode != 0:
+            return {"keys": set(), "default": None, "error_type": "discovery_failed"}
         payload = json.loads(result.stdout or "{}")
-        return {
-            item.get("key")
-            for item in payload.get("models", [])
-            if item.get("available") is True
-        }
+        items = payload.get("models", [])
+        if not isinstance(items, list):
+            raise ValueError("invalid model list")
+        available = [item for item in items if isinstance(item, dict)
+                     and item.get("available") is True and isinstance(item.get("key"), str)]
+        default = next((item["key"] for item in available if "default" in (item.get("tags") or [])), None)
+        return {"keys": {item["key"] for item in available}, "default": default, "error_type": None}
+    except subprocess.TimeoutExpired:
+        return {"keys": set(), "default": None, "error_type": "timeout"}
     except Exception:
-        return set()
+        return {"keys": set(), "default": None, "error_type": "discovery_failed"}
 
 
-def _run_model_once(model, prompt="只回复pong", timeout_seconds=45):
+def _configured_model_keys():
+    return _configured_model_metadata()["keys"]
+
+
+def _model_candidates(metadata, route=None):
+    route = _model_route_snapshot() if route is None else route
+    if not route.get("ok"):
+        return []
+    if route.get("installed"):
+        return [route["selected_model"]]
+    primary = MODEL_PRIMARY or metadata.get("default")
+    return list(dict.fromkeys(item for item in [primary] + MODEL_FALLBACK_CANDIDATES[:2] if item))
+
+
+def _model_budget(timeout_seconds):
+    budget = max(1.0, float(timeout_seconds))
+    try:
+        configured = float(os.environ.get("LOBSTER_QUANT_MODEL_TIMEOUT_SECONDS", "inf"))
+        if configured > 0:
+            budget = min(budget, configured)
+    except ValueError:
+        pass
+    return budget
+
+
+def _run_model_once(model, prompt="只回复pong", timeout_seconds=45, route=None):
     started = time.monotonic()
-    session_id = f"model-probe-{uuid.uuid4().hex[:16]}"
+    controlled = bool(route and route.get("installed"))
+    if controlled and model != route.get("selected_model"):
+        return {"ok": False, "model": model, "latency_seconds": 0,
+                "error_type": "traffic_policy_blocked", "request_id": None,
+                "provider_summary": "请求模型与受控路由不一致，未发起请求。"}
+    # One-shot inference has no agent tools, workspace bootstrap or delivery.
+    # Older hosts fail explicitly; never retry via a full tool-enabled agent.
     command = [
-        "openclaw", "agent", "--local", "--agent", "main",
-        "--session-id", session_id,
+        "openclaw", "infer", "model", "run", "--local",
         "--model", model,
-        "--message", prompt,
-        "--json",
-        "--timeout", str(int(timeout_seconds))
+        "--prompt", prompt,
+        "--json"
     ]
+    try:
+        options = _model_subprocess_options(route)
+    except Exception:
+        return {"ok": False, "model": model, "latency_seconds": 0,
+                "error_type": "traffic_policy_blocked", "request_id": None,
+                "provider_summary": "受控模型执行环境不一致，未发起请求。"}
     try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=timeout_seconds + 10,
-            check=False
+            timeout=timeout_seconds,
+            check=False,
+            **options,
         )
     except subprocess.TimeoutExpired as exc:
         latency = round(time.monotonic() - started, 3)
@@ -1495,6 +1781,11 @@ def _run_model_once(model, prompt="只回复pong", timeout_seconds=45):
             "request_id": None,
             "provider_summary": "模型请求超时"
         }
+    except OSError:
+        return {"ok": False, "model": model,
+                "latency_seconds": round(time.monotonic() - started, 3),
+                "error_type": "cli_unavailable", "request_id": None,
+                "provider_summary": _model_error_summary("cli_unavailable")}
 
     latency = round(time.monotonic() - started, 3)
     combined = "\n".join(x for x in (result.stdout, result.stderr) if x).strip()
@@ -1511,22 +1802,36 @@ def _run_model_once(model, prompt="只回复pong", timeout_seconds=45):
 
     try:
         payload = json.loads(result.stdout or "{}")
+        evidence = {}
+        if controlled:
+            # OpenClaw local model.run reports the resolved provider and bare id,
+            # after alias resolution. A requested --model alone is not evidence.
+            provider = payload.get("provider") if isinstance(payload, dict) else None
+            resolved_id = payload.get("model") if isinstance(payload, dict) else None
+            expected_provider, expected_id = model.split("/", 1)
+            complete = isinstance(provider, str) and bool(provider) and isinstance(resolved_id, str) and bool(resolved_id)
+            if not complete or provider != expected_provider or resolved_id != expected_id:
+                return {"ok": False, "model": model, "latency_seconds": latency,
+                        "error_type": "model_routing_mismatch" if complete else "model_routing_unverified",
+                        "request_id": None,
+                        "provider_summary": "模型返回的路由证据缺失或与选定模型不一致；结果未采用，未尝试其他模型。"}
+            evidence = {"routing_verified": True, "resolved_model": provider + "/" + resolved_id}
         texts = [
             str(item.get("text", "")).strip()
-            for item in payload.get("payloads", [])
-            if str(item.get("text", "")).strip()
+            for item in payload.get("outputs", [])
+            if isinstance(item, dict) and str(item.get("text", "")).strip()
         ]
-        if not texts:
+        if payload.get("ok") is not True or not texts:
             raise ValueError("empty response")
-        agent_meta = (payload.get("meta") or {}).get("agentMeta") or {}
         return {
             "ok": True,
             "model": model,
             "latency_seconds": latency,
             "error_type": None,
             "request_id": None,
-            "provider_summary": f"{agent_meta.get('provider', 'unknown')} 返回成功",
-            "text": "\n".join(texts)
+            "provider_summary": f"{payload.get('provider', 'unknown')} 返回成功",
+            "text": "\n".join(texts),
+            **evidence,
         }
     except Exception as exc:
         return {
@@ -1535,31 +1840,80 @@ def _run_model_once(model, prompt="只回复pong", timeout_seconds=45):
             "latency_seconds": latency,
             "error_type": "empty_response" if "empty" in str(exc).lower() else "json_parse_error",
             "request_id": _model_request_id(combined),
-            "provider_summary": f"模型返回无法解析：{str(exc)[:120]}"
+            "provider_summary": "模型返回格式无效或为空"
         }
 
 
 def _write_model_fallback_log(event):
+    folder_fd = file_fd = None
     try:
-        os.makedirs(os.path.dirname(MODEL_FALLBACK_LOG_PATH), exist_ok=True)
-        row = dict(event)
+        folder = os.path.dirname(MODEL_FALLBACK_LOG_PATH)
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        folder_fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if os.fstat(folder_fd).st_uid != os.geteuid():
+            return
+        name = os.path.basename(MODEL_FALLBACK_LOG_PATH)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        previous = None
+        try:
+            file_fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=folder_fd)
+            created = True
+        except FileExistsError:
+            previous = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(previous.st_mode) or previous.st_uid != os.geteuid()
+                    or previous.st_nlink != 1 or stat.S_IMODE(previous.st_mode) & ~0o600
+                    or not previous.st_mode & 0o200):
+                return
+            file_fd = os.open(name, flags, dir_fd=folder_fd)
+            created = False
+        info = os.fstat(file_fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1):
+            return
+        if previous is not None and ((previous.st_dev, previous.st_ino) != (info.st_dev, info.st_ino)
+                or stat.S_IMODE(info.st_mode) & ~0o600 or not info.st_mode & 0o200):
+            return
+        if created:
+            # Apply exact permissions only to the new file, even under a strict
+            # umask. Existing logs are never chmod'ed, read, truncated or moved.
+            os.fchmod(file_fd, 0o600)
+        # Never persist raw provider text, prompts, credentials or extracted ids.
+        row = {key: event[key] for key in ("event", "primary_model", "fallback_model", "error_type")
+               if key in event}
         row["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(MODEL_FALLBACK_LOG_PATH, "a", encoding="utf-8") as handle:
+        with os.fdopen(file_fd, "a", encoding="utf-8") as handle:
+            file_fd = None
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:
+        # Logging must not expose OS errors or change model routing behavior.
         pass
+    finally:
+        for descriptor in (file_fd, folder_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def model_call_with_fallback(prompt, timeout_seconds=90):
-    allowed = _configured_model_keys()
+    started = time.monotonic()
+    deadline = started + _model_budget(timeout_seconds)
+    route = _model_route_snapshot()
+    if not route.get("ok"):
+        return _model_route_error(route)
+    discovery_timeout = min(20, max(0.1, deadline - time.monotonic()))
+    metadata = (_configured_model_metadata(discovery_timeout, route=route) if route.get("installed")
+                else _configured_model_metadata(discovery_timeout))
+    if metadata.get("error_type"):
+        return {"ok": False, "message": _model_error_summary(metadata["error_type"]),
+                "error_type": metadata["error_type"], "attempts": [],
+                "latency_seconds": round(time.monotonic() - started, 3)}
+    allowed = metadata["keys"]
     attempts = []
-    candidates = [item for item in [MODEL_PRIMARY] + MODEL_FALLBACK_CANDIDATES[:2] if item]
+    candidates = _model_candidates(metadata, route)
     if not candidates:
-        return {
-            "ok": False,
-            "message": "未配置模型链；请在 OpenClaw 插件配置中设置 primaryModel 或 fallbackModels。",
-            "attempts": [],
-        }
+        return {"ok": False, "message": "没有可用默认模型；请检查 OpenClaw 默认模型或显式配置 primaryModel。", "attempts": []}
     for index, model in enumerate(candidates):
         if model not in allowed:
             attempt = {
@@ -1571,13 +1925,20 @@ def model_call_with_fallback(prompt, timeout_seconds=90):
                 "provider_summary": "模型未配置或不在允许列表"
             }
         else:
-            attempt = _run_model_once(model, prompt, timeout_seconds)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                attempts.append({"ok": False, "model": model, "latency_seconds": 0,
+                                 "error_type": "timeout", "request_id": None,
+                                 "provider_summary": "模型请求总时间预算已耗尽"})
+                break
+            attempt = (_run_model_once(model, prompt, remaining, route=route) if route.get("installed")
+                       else _run_model_once(model, prompt, remaining))
         attempts.append(attempt)
         if attempt.get("ok"):
             if index > 0:
                 _write_model_fallback_log({
                     "event": "fallback_model_used",
-                    "primary_model": MODEL_PRIMARY,
+                    "primary_model": candidates[0],
                     "fallback_model": model,
                     "error_type": attempts[0].get("error_type"),
                     "request_id": attempts[0].get("request_id")
@@ -1587,7 +1948,8 @@ def model_call_with_fallback(prompt, timeout_seconds=90):
                 "model": model,
                 "fallback_used": index > 0,
                 "text": attempt.get("text"),
-                "attempts": attempts
+                "attempts": attempts,
+                "latency_seconds": round(time.monotonic() - started, 3),
             }
         if index == 0:
             _write_model_fallback_log({
@@ -1596,22 +1958,40 @@ def model_call_with_fallback(prompt, timeout_seconds=90):
                 "error_type": attempt.get("error_type"),
                 "request_id": attempt.get("request_id")
             })
+        if attempt.get("error_type") in {"unsupported_cli", "cli_unavailable", "traffic_policy_blocked", "model_routing_mismatch", "model_routing_unverified"}:
+            return {"ok": False, "message": attempt["provider_summary"],
+                    "attempts": attempts, "latency_seconds": round(time.monotonic() - started, 3)}
 
     billing = any(item.get("error_type") == "billing_error" for item in attempts)
+    timed_out = time.monotonic() >= deadline
     message = (
+        "模型请求总时间预算已耗尽；未继续启动其他模型。请稍后重试或检查上游响应速度。"
+        if timed_out else
         "模型通道返回额度/计费异常，但不一定是账户总余额不足，可能是当前模型通道临时不可用。"
-        "系统已尝试备用模型。"
+        "请检查所用模型通道。"
         if billing else
-        "模型服务暂时不可用，主模型和备用模型都未成功响应。"
+        "模型服务暂时不可用，配置的模型本次未成功响应。"
         "可能是上游通道、额度或网络波动，请稍后重试。"
     )
-    return {"ok": False, "message": message, "attempts": attempts}
+    return {"ok": False, "message": message, "attempts": attempts,
+            "latency_seconds": round(time.monotonic() - started, 3)}
 
 
 def model_ping():
-    allowed = _configured_model_keys()
+    started = time.monotonic()
+    deadline = started + _model_budget(90)
+    route = _model_route_snapshot()
+    if not route.get("ok"):
+        return _model_route_error(route)
+    discovery_timeout = min(20, max(0.1, deadline - time.monotonic()))
+    metadata = (_configured_model_metadata(discovery_timeout, route=route) if route.get("installed")
+                else _configured_model_metadata(discovery_timeout))
+    if metadata.get("error_type"):
+        return {"ok": False, "message": _model_error_summary(metadata["error_type"]), "models": []}
+    allowed = metadata["keys"]
+    candidates = _model_candidates(metadata, route)
     results = []
-    for model in [item for item in [MODEL_PRIMARY] + MODEL_FALLBACK_CANDIDATES if item]:
+    for model in candidates:
         if model not in allowed:
             results.append({
                 "ok": False,
@@ -1622,13 +2002,24 @@ def model_ping():
                 "provider_summary": "模型未配置或不在允许列表"
             })
             continue
-        results.append(_run_model_once(model, "只回复pong", 45))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            results.append({"ok": False, "model": model, "latency_seconds": 0,
+                            "error_type": "timeout", "request_id": None,
+                            "provider_summary": "总时间预算已耗尽，此模型未开始探测"})
+            break
+        result = (_run_model_once(model, "只回复pong", min(45, remaining), route=route) if route.get("installed")
+                  else _run_model_once(model, "只回复pong", min(45, remaining)))
+        results.append(result)
+        if result.get("error_type") in {"unsupported_cli", "cli_unavailable", "traffic_policy_blocked", "model_routing_mismatch", "model_routing_unverified"}:
+            break
     return {
         "ok": any(item.get("ok") for item in results),
-        "primary_model": MODEL_PRIMARY,
-        "fallback_candidates": MODEL_FALLBACK_CANDIDATES,
+        "primary_model": candidates[0] if candidates else None,
+        "fallback_candidates": candidates[1:],
         "gateway_fallback_config_changed": False,
-        "scope_note": "此命令只探测脚本侧 fallback；不会修改 OpenClaw 的全局模型配置。",
+        "scope_note": "只探测脚本侧配置的模型；没有修改 OpenClaw 默认模型或全局 fallback。",
+        "latency_seconds": round(time.monotonic() - started, 3),
         "models": results
     }
 
@@ -1663,7 +2054,8 @@ def parse_sina_quote_text(text, symbol):
 
     def to_float(v):
         try:
-            return float(v) if v not in (None, "") else None
+            number = float(v) if v not in (None, "") else None
+            return number if number is not None and math.isfinite(number) else None
         except Exception:
             return None
 
@@ -1754,7 +2146,7 @@ def parse_sina_quote_text(text, symbol):
         "五档委差_手": round(order_difference / 100, 4) if order_difference is not None else None,
         "五档委差单位": "股",
         "盘口委比%": order_imbalance,
-        "买卖盘强弱比": round(bid_volume / ask_volume, 4) if ask_volume > 0 else None,
+        "买卖盘强弱比": round(bid_volume / ask_volume, 4) if order_book_complete and ask_volume > 0 else None,
         "数据源": "sina",
         "数据来源": "新浪实时行情",
         "数据时间": quote_time,
@@ -1806,8 +2198,14 @@ def quote_sina_by_code(sina_code, symbol, name=None):
 
 
 def quote_us(symbol):
-    """Fetch a delayed US-market snapshot from Yahoo Finance's public chart endpoint."""
+    """Fetch a delayed US-market snapshot with an actual prior-session reference."""
+    import math
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
     ticker = str(symbol).strip().upper()
+    if not re.fullmatch(r"[A-Z^][A-Z0-9.^-]{0,14}", ticker):
+        raise ValueError("invalid_us_symbol")
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
     response = requests.get(
         url,
@@ -1821,23 +2219,59 @@ def quote_us(symbol):
     if not isinstance(result, dict):
         raise RuntimeError("us_quote_unavailable")
     meta = result.get("meta") or {}
-    price = meta.get("regularMarketPrice")
-    previous = meta.get("chartPreviousClose") or meta.get("previousClose")
-    change = (price - previous) if price is not None and previous else None
-    percent = (change / previous * 100) if change is not None and previous else None
+
+    def finite(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None
+
+    price = finite(meta.get("regularMarketPrice"))
+    market_time = finite(meta.get("regularMarketTime"))
+    previous = finite(meta.get("previousClose"))
+    previous_source = "meta.previousClose" if previous is not None else None
+    # chartPreviousClose belongs to the requested five-day range, not necessarily
+    # the previous session. Derive the last earlier trading date when necessary.
+    if previous is None and market_time is not None:
+        try:
+            market_zone = ZoneInfo(meta.get("exchangeTimezoneName") or "America/New_York")
+            session_date = datetime.fromtimestamp(market_time, market_zone).date()
+            quote_rows = (result.get("indicators") or {}).get("quote") or [{}]
+            closes = quote_rows[0].get("close") or []
+            candidates = []
+            for timestamp, close in zip(result.get("timestamp") or [], closes):
+                timestamp, close = finite(timestamp), finite(close)
+                if timestamp is not None and close is not None and datetime.fromtimestamp(timestamp, market_zone).date() < session_date:
+                    candidates.append((timestamp, close))
+            if candidates:
+                previous = max(candidates)[1]
+                previous_source = "previous completed daily bar"
+        except (ValueError, TypeError, OverflowError, KeyError):
+            pass
+    change = price - previous if price is not None and previous is not None and previous > 0 else None
+    percent = change / previous * 100 if change is not None else None
+    try:
+        quote_time = datetime.fromtimestamp(market_time, timezone.utc).isoformat() if market_time is not None else None
+    except (ValueError, OverflowError, OSError):
+        quote_time = None
     return {
         "代码": ticker,
         "名称": meta.get("shortName") or meta.get("longName") or ticker,
         "最新价": price,
+        "昨收": previous,
+        "昨收来源": previous_source,
         "涨跌额": round(change, 4) if change is not None else None,
         "涨跌幅%": round(percent, 4) if percent is not None else None,
         "币种": meta.get("currency") or "USD",
         "交易所": meta.get("exchangeName"),
         "市场状态": meta.get("marketState"),
         "数据源": "Yahoo Finance public chart endpoint",
-        "数据说明": "可能延迟，仅供研究参考",
-        "数据获取时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "数据说明": "可能延迟，仅供研究参考；缺少可核验前收盘时不计算日涨跌幅",
+        "数据时间": quote_time,
+        "数据获取时间": datetime.now(timezone.utc).isoformat(),
     }
+
 
 
 def us_index():
@@ -1867,12 +2301,14 @@ def index(_symbol=None):
 
 def _is_index_or_etf(symbol):
     s = str(symbol).strip().lower()
-    raw = s[2:] if s.startswith(("sh", "sz")) else s
-    index_codes = {"000001", "399001", "399006", "000688", "000016", "000300", "000905"}
+    prefix = s[:2] if s.startswith(("sh", "sz")) else ""
+    raw = s[2:] if prefix else s
+    sh_indices = {"000001", "000688", "000016", "000300", "000905"}
+    sz_indices = {"399001", "399006"}
     etf_codes = {"510050", "159915", "512000", "510300", "510500"}
     index_names = {"上证指数", "深证成指", "创业板指", "科创50", "上证50", "沪深300", "中证500"}
     etf_names = {"上证50etf", "沪深300etf", "创业板etf", "中证500etf"}
-    return raw in index_codes or raw in etf_codes or s in index_names or s in etf_names
+    return (prefix == "sh" and raw in sh_indices) or (prefix != "sh" and raw in sz_indices) or raw in etf_codes or s in index_names or s in etf_names
 
 
 def lhb(date=None, symbol=None, emit=True):
@@ -1893,13 +2329,17 @@ def lhb(date=None, symbol=None, emit=True):
             print_json(result)
         return result
 
+    if symbol:
+        symbol = re.sub(r"^(?:sh|sz)", "", symbol.lower())
+        if not re.fullmatch(r"[0-9]{6}", symbol):
+            result = {"error": "龙虎榜个股查询需要六位证券代码。"}
+            if emit:
+                print_json(result)
+            return result
     try:
         import akshare as ak
     except ImportError:
-        result = {
-            "error": "暂缺（当前安装未启用 AkShare 扩展数据源）",
-            "details": "从源码运行 ./scripts/install.sh 可安装该可选数据源。",
-        }
+        result = {"error": "暂缺（龙虎榜数据依赖 akshare 未安装）"}
         if emit:
             print_json(result)
         return result
@@ -1936,11 +2376,11 @@ def lhb(date=None, symbol=None, emit=True):
                 return c
         return None
 
-    # 指定个股：优先查最近 60 天龙虎榜，再按代码过滤
+    # 指定日期时只查询该日；未指定日期才查询最近 60 天。
     if symbol:
         try:
-            end_date = today
-            start_date = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
+            end_date = _normalize_report_date(date) if date else today
+            start_date = end_date if date else (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
             df = ak.stock_lhb_detail_em(start_date=start_date, end_date=end_date)
         except Exception as e:
             result = {"error": "暂缺（东方财富接口不可用）", "details": str(e)}
@@ -1957,7 +2397,7 @@ def lhb(date=None, symbol=None, emit=True):
 
             code_col = _find_code_col(df)
             if code_col:
-                mask = df[code_col].astype(str).str.contains(symbol, na=False)
+                mask = df[code_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6).eq(symbol)
                 sub = df[mask].copy()
             else:
                 # 找不到代码列时，退化为全文匹配
@@ -1975,9 +2415,11 @@ def lhb(date=None, symbol=None, emit=True):
                     sub = sub.sort_values(date_col, ascending=False)
                     break
 
-            records = [_clean_row(r) for _, r in sub.head(10).iterrows()]
+            records = [_clean_row(r) for _, r in sub.iterrows()]
             result = {
                 "symbol": symbol,
+                "date": end_date if date else None,
+                "mode": "指定日期龙虎榜" if date else "最近60日龙虎榜（非单日）",
                 "range": f"{start_date}-{end_date}",
                 "rows": int(len(sub)),
                 "records": records,
@@ -1995,7 +2437,7 @@ def lhb(date=None, symbol=None, emit=True):
     # 未指定个股：自动查最近一个有龙虎榜数据的交易日
     query_dates = []
     if date:
-        query_dates = [str(date)]
+        query_dates = [_normalize_report_date(date)]
     else:
         # 从今天往前倒查最多 10 天，自动跳过周末/无数据日
         for i in range(0, 11):
@@ -2014,7 +2456,7 @@ def lhb(date=None, symbol=None, emit=True):
                 continue
 
             records = []
-            for _, r in df.head(30).iterrows():
+            for _, r in df.iterrows():
                 try:
                     records.append(_clean_row(r))
                 except Exception:
@@ -2240,6 +2682,7 @@ def morning_report(limit=8, emit=True):
 
     result = {
         "report_type": "morning_report",
+        "date": _normalize_report_date(),
         "title": "盘前播报",
         "说明": "盘前播报以昨收后到开盘前的新闻、政策、海外市场和产业消息为主，指数只作背景。",
         "sections": {
@@ -2411,20 +2854,13 @@ def _rank_quotes(items, key="涨跌幅%", reverse=True, limit=8):
 
 
 def _after_market_judgement(index_rows):
-    try:
-        rows = [x for x in index_rows if isinstance(x, dict) and x.get("涨跌幅%") is not None]
-        if not rows:
-            return "指数数据暂缺，先观察主线题材和量能变化。"
-        avg = sum(float(x.get("涨跌幅%") or 0) for x in rows[:5]) / max(len(rows[:5]), 1)
-        strong = [x.get("名称") for x in rows[:5] if float(x.get("涨跌幅%") or 0) >= 1.5]
-        weak = [x.get("名称") for x in rows[:5] if float(x.get("涨跌幅%") or 0) <= -1.0]
-        if avg >= 1.2:
-            return f"主要指数整体偏强，平均涨幅约{avg:.2f}%，强势指数：{', '.join(strong) if strong else '暂无'}。盘后重点看热点能否延续，避免次日高开兑现。"
-        if avg <= -1.0:
-            return f"主要指数整体偏弱，平均跌幅约{avg:.2f}%，弱势指数：{', '.join(weak) if weak else '暂无'}。盘后重点看是否有护盘方向和超跌修复线索。"
-        return f"主要指数整体震荡，平均涨跌幅约{avg:.2f}%。盘后重点看结构性热点、成交额和次日资金承接。"
-    except Exception:
-        return "盘后判断暂缺（样本不足）"
+    rows = [row for row in index_rows if isinstance(row, dict) and not row.get("error") and _to_float(row.get("涨跌幅%")) is not None]
+    if not rows:
+        return "指数数据暂缺，暂不判断市场强弱。"
+    values = [_to_float(row["涨跌幅%"]) for row in rows[:5]]
+    avg = sum(values) / len(values)
+    view = "偏强" if avg >= 1.2 else "偏弱" if avg <= -1 else "震荡"
+    return f"可用指数样本 {len(values)} 个，等权平均涨跌幅约{avg:.2f}%，指数表现{view}；该均值不是全A收益率。"
 
 
 def _to_float(v, default=None):
@@ -2435,7 +2871,8 @@ def _to_float(v, default=None):
             v = v.replace("%", "").replace(",", "").strip()
             if v in ("", "-", "--", "None", "nan"):
                 return default
-        return float(v)
+        number = float(v)
+        return number if math.isfinite(number) else default
     except Exception:
         return default
 
@@ -2488,7 +2925,7 @@ def _normalize_spot_df(df):
             df[col] = None
 
     for col in ["最新价", "涨跌额", "涨跌幅", "成交量", "成交额"]:
-        df[col] = df[col].apply(lambda x: _to_float(x, 0))
+        df[col] = df[col].apply(lambda x: _to_float(x))
 
     return df
 
@@ -2514,7 +2951,7 @@ def save_market_overview_cache(data):
         pass
 
 
-def load_market_overview_cache():
+def load_market_overview_cache(max_age_seconds=900):
     """读取最近一次成功的全A市场概览缓存。"""
     try:
         if not os.path.exists(MARKET_OVERVIEW_CACHE_PATH):
@@ -2523,7 +2960,13 @@ def load_market_overview_cache():
             data = json.load(f)
         if not isinstance(data, dict) or data.get("error"):
             return None
+        cached_at = datetime.fromisoformat(data.get("cached_at", ""))
+        age = (datetime.now() - cached_at).total_seconds()
+        if age < 0 or age > max_age_seconds:
+            return None
         data = dict(data)
+        data["缓存年龄_秒"] = round(age)
+        data["原始数据源"] = data.get("数据源")
         data["数据源"] = "cache / 最近一次成功全A市场概览"
         data["使用缓存"] = True
         return data
@@ -2552,6 +2995,9 @@ def market_overview_sina(limit=10):
     try:
         df = ak.stock_zh_a_spot()
         df = _normalize_spot_df(df)
+        if df is not None and not df.empty and not df["涨跌幅"].notna().any():
+            df = None
+            raise ValueError("全A涨跌幅没有有效样本")
         if df is not None and not df.empty:
             source = "akshare.stock_zh_a_spot / 新浪A股实时"
     except Exception as e:
@@ -2562,6 +3008,9 @@ def market_overview_sina(limit=10):
         try:
             df = ak.stock_zh_a_spot_em()
             df = _normalize_spot_df(df)
+            if df is not None and not df.empty and not df["涨跌幅"].notna().any():
+                df = None
+                raise ValueError("全A涨跌幅没有有效样本")
             if df is not None and not df.empty:
                 source = "akshare.stock_zh_a_spot_em / 东方财富A股实时"
         except Exception as e:
@@ -2585,16 +3034,21 @@ def market_overview_sina(limit=10):
     limit_up_count = int((df["涨跌幅"] >= 9.8).sum()) if "涨跌幅" in df.columns else None
     limit_down_count = int((df["涨跌幅"] <= -9.8).sum()) if "涨跌幅" in df.columns else None
 
-    rise_top = df.sort_values("涨跌幅", ascending=False).head(limit).apply(_stock_row_to_dict, axis=1).tolist()
-    fall_top = df.sort_values("涨跌幅", ascending=True).head(limit).apply(_stock_row_to_dict, axis=1).tolist()
-    amount_top = df.sort_values("成交额", ascending=False).head(limit).apply(_stock_row_to_dict, axis=1).tolist()
+    rise_top = df.dropna(subset=["涨跌幅"]).sort_values("涨跌幅", ascending=False).head(limit).apply(_stock_row_to_dict, axis=1).tolist()
+    fall_top = df.dropna(subset=["涨跌幅"]).sort_values("涨跌幅", ascending=True).head(limit).apply(_stock_row_to_dict, axis=1).tolist()
+    amount_top = df.dropna(subset=["成交额"]).sort_values("成交额", ascending=False).head(limit).apply(_stock_row_to_dict, axis=1).tolist()
 
-    total_amount = _to_float(df["成交额"].sum(), 0) if "成交额" in df.columns else None
+    total_amount = _to_float(df["成交额"].sum(min_count=1)) if "成交额" in df.columns else None
 
     result = {
         "数据源": source,
         "股票数量": int(len(df)),
+        "数据获取时间": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
+        "时效说明": "全A接口不提供统一交易日期；仅能核对获取时间，不能保证为当日收盘。",
         "市场宽度": {
+            "涨跌幅有效样本": int(df["涨跌幅"].notna().sum()),
+            "涨跌幅缺失家数": int(df["涨跌幅"].isna().sum()),
+            "成交额有效样本": int(df["成交额"].notna().sum()),
             "上涨家数": up_count,
             "下跌家数": down_count,
             "平盘家数": flat_count,
@@ -2614,241 +3068,97 @@ def market_overview_sina(limit=10):
 
 
 def analyze_lhb_enhanced(lhb_result, watch_items=None, holding_items=None, limit=10):
-    """
-    龙虎榜增强分析，按“去重后个股”聚合统计。
-    解决同一股票因多个上榜原因重复出现导致的重复计算问题。
-    """
-    watch_items = watch_items or []
-    holding_items = holding_items or []
+    """Deduplicate same-day disclosures; conflicting observation windows are not additive."""
+    if not isinstance(lhb_result, dict) or lhb_result.get("error"):
+        return {"error": (lhb_result or {}).get("error", "龙虎榜数据格式异常") if isinstance(lhb_result, dict) else "龙虎榜数据格式异常"}
+    records = lhb_result.get("records") or []
+    grouped = {}
+    warnings = []
 
-    if not isinstance(lhb_result, dict):
-        return {"error": "龙虎榜数据格式异常"}
-
-    records = lhb_result.get("records", []) or []
-    if not records:
-        return {
-            "龙虎榜完整统计": {
-                "原始记录数": 0,
-                "去重后个股数": 0,
-                "说明": "未获取到龙虎榜明细或接口返回为空"
-            }
-        }
-
-    def to_float(x):
-        try:
-            if x is None:
-                return 0.0
-            if isinstance(x, str):
-                raw = x.strip()
-                mult = 1.0
-                if raw.endswith("亿"):
-                    mult = 100000000.0
-                    raw = raw[:-1]
-                elif raw.endswith("万"):
-                    mult = 10000.0
-                    raw = raw[:-1]
-                raw = raw.replace(",", "").replace("%", "").strip()
-                if raw in {"", "-", "None", "nan"}:
-                    return 0.0
-                return float(raw) * mult
-            return float(x)
-        except Exception:
-            return 0.0
-
-    def clean_code(x):
-        return str(x or "").replace("sh", "").replace("sz", "").strip()
-
-    def stock_name(r):
-        return str(r.get("股票") or r.get("股票名称") or r.get("名称") or r.get("name") or "")
-
-    def stock_code(r):
-        return clean_code(r.get("代码") or r.get("股票代码") or r.get("symbol"))
-
-    def reason(r):
-        return str(r.get("上榜原因") or r.get("解读") or r.get("reason") or "")
-
-    def net_amount(r):
-        for k in ("龙虎榜净买额", "净买额", "净买入额", "净买入", "龙虎榜净买入额"):
-            if k in r:
-                return to_float(r.get(k))
-        return buy_amount(r) - sell_amount(r)
-
-    def buy_amount(r):
-        for k in ("买入额", "龙虎榜买入额", "买入金额"):
-            if k in r:
-                return to_float(r.get(k))
-        return 0.0
-
-    def sell_amount(r):
-        for k in ("卖出额", "龙虎榜卖出额", "卖出金额"):
-            if k in r:
-                return to_float(r.get(k))
-        return 0.0
-
-    def pct_amount(r):
-        for k in ("涨跌幅", "涨跌幅%", "涨跌幅_百分比"):
-            if k in r:
-                return to_float(r.get(k))
-        return 0.0
-
-    def close_price(r):
-        for k in ("收盘价", "最新价", "价格"):
-            if k in r:
-                return r.get(k)
+    def amount(row, keys):
+        for key in keys:
+            if key in row:
+                value = row[key]
+                mult = 1
+                if isinstance(value, str) and value.endswith(("亿", "万")):
+                    mult = 100000000 if value.endswith("亿") else 10000
+                    value = value[:-1]
+                parsed = _to_float(value)
+                return parsed * mult if parsed is not None else None
         return None
 
-    # 按股票代码聚合，避免同一股票多原因上榜重复计算
-    grouped = {}
-    for r in records:
-        c = stock_code(r)
-        n = stock_name(r)
-        key = c or n
-        if not key:
+    def code_of(row):
+        return str(row.get("代码") or row.get("股票代码") or row.get("symbol") or "").removeprefix("sh").removeprefix("sz").zfill(6)
+
+    for record in records:
+        if not isinstance(record, dict):
             continue
-
+        code = code_of(record)
+        if code == "000000":
+            warnings.append("存在无股票代码的记录，未纳入统计")
+            continue
+        date = str(record.get("上榜日") or record.get("交易日期") or record.get("日期") or lhb_result.get("date") or "未知日期")
+        key = (date, code)
+        buy = amount(record, ("买入额", "龙虎榜买入额", "买入金额"))
+        sell = amount(record, ("卖出额", "龙虎榜卖出额", "卖出金额"))
+        net = amount(record, ("龙虎榜净买额", "净买额", "净买入额", "净买入", "龙虎榜净买入额"))
+        if net is None and buy is not None and sell is not None:
+            net = buy - sell
+        values = (buy, sell, net)
+        reason = str(record.get("上榜原因") or record.get("解读") or "")
         if key not in grouped:
-            grouped[key] = {
-                "代码": c,
-                "股票": n,
-                "上榜原因列表": [],
-                "原始记录数": 0,
-                "收盘价": close_price(r),
-                "涨跌幅": pct_amount(r),
-                "买入额": 0.0,
-                "卖出额": 0.0,
-                "龙虎榜净买额": 0.0,
-                "资金判断": "",
-                "风险提示": "",
-            }
-
-        g = grouped[key]
-        g["原始记录数"] += 1
-        rs = reason(r)
-        if rs and rs not in g["上榜原因列表"]:
-            g["上榜原因列表"].append(rs)
-
-        g["买入额"] += buy_amount(r)
-        g["卖出额"] += sell_amount(r)
-        g["龙虎榜净买额"] += net_amount(r)
-
-        # 涨跌幅保留绝对值更大的那条，方便涨跌榜排序
-        p0 = abs(to_float(g.get("涨跌幅")))
-        p1 = abs(pct_amount(r))
-        if p1 > p0:
-            g["涨跌幅"] = pct_amount(r)
-            g["收盘价"] = close_price(r)
-
-        if r.get("资金判断"):
-            g["资金判断"] = r.get("资金判断")
-        if r.get("风险提示"):
-            g["风险提示"] = r.get("风险提示")
-
+            grouped[key] = {"代码": code, "股票": record.get("名称") or record.get("股票简称") or record.get("股票") or code,
+                            "日期": date, "涨跌幅": amount(record, ("涨跌幅", "涨跌幅%")),
+                            "收盘价": _to_float(record.get("收盘价")), "买入额": buy,
+                            "卖出额": sell, "龙虎榜净买额": net, "原始记录数": 0,
+                            "上榜原因列表": [], "_values": values, "统计冲突": False}
+        row = grouped[key]
+        row["原始记录数"] += 1
+        if reason and reason not in row["上榜原因列表"]:
+            row["上榜原因列表"].append(reason)
+        if values != row["_values"]:
+            row["统计冲突"] = True
+            row["买入额"] = row["卖出额"] = row["龙虎榜净买额"] = None
+            warnings.append(f"{date} {code} 多原因上榜金额不一致，可能含不同统计区间，金额不合并")
     rows = list(grouped.values())
+    for row in rows:
+        row.pop("_values")
+        row["上榜原因"] = "；".join(row.pop("上榜原因列表"))
+    valid = [row for row in rows if row["龙虎榜净买额"] is not None]
+    net = sum(row["龙虎榜净买额"] for row in valid) if valid else None
+    complete = bool(rows) and len(valid) == len(rows)
+    conclusion = ("本次有效龙虎榜样本净买入。" if net > 0 else "本次有效龙虎榜样本净卖出。" if net < 0 else "本次有效龙虎榜样本净额接近零。") if complete else "龙虎榜缺失或存在冲突，不作整体资金方向判断。"
+    if lhb_result.get("rows", len(records)) > len(records):
+        warnings.append("龙虎榜明细是截断样本，统计不代表全市场")
+        conclusion = "龙虎榜仅返回部分明细，不作全市场资金方向判断。"
 
-    def simple_row(g):
-        return {
-            "代码": g.get("代码"),
-            "股票": g.get("股票"),
-            "涨跌幅": g.get("涨跌幅"),
-            "收盘价": g.get("收盘价"),
-            "龙虎榜净买额": g.get("龙虎榜净买额"),
-            "买入额": g.get("买入额"),
-            "卖出额": g.get("卖出额"),
-            "上榜原因": "；".join(g.get("上榜原因列表", [])),
-            "原始记录数": g.get("原始记录数"),
-            "资金判断": g.get("资金判断", ""),
-            "风险提示": g.get("风险提示", "")
-        }
+    def top(field, reverse):
+        return sorted([row for row in rows if row.get(field) is not None], key=lambda row: row[field], reverse=reverse)[:limit]
 
-    net_buy_top = [simple_row(x) for x in sorted(rows, key=lambda x: x.get("龙虎榜净买额", 0), reverse=True)[:limit]]
-    net_sell_top = [simple_row(x) for x in sorted(rows, key=lambda x: x.get("龙虎榜净买额", 0))[:limit]]
-    rise_top = [simple_row(x) for x in sorted(rows, key=lambda x: x.get("涨跌幅", 0), reverse=True)[:limit]]
-    fall_top = [simple_row(x) for x in sorted(rows, key=lambda x: x.get("涨跌幅", 0))[:limit]]
+    def hits(items):
+        codes = {str(item.get("code") if isinstance(item, dict) else item).removeprefix("sh").removeprefix("sz") for item in items or []}
+        return [row for row in rows if row["代码"] in codes]
 
-    watch_codes = set()
-    watch_names = set()
-    for item in watch_items:
-        if isinstance(item, dict):
-            watch_codes.add(clean_code(item.get("code")))
-            watch_names.add(str(item.get("name", "")).strip())
-        else:
-            watch_codes.add(clean_code(item))
-
-    holding_codes = set()
-    holding_names = set()
-    for item in holding_items:
-        if isinstance(item, dict):
-            holding_codes.add(clean_code(item.get("code")))
-            holding_names.add(str(item.get("name", "")).strip())
-        else:
-            holding_codes.add(clean_code(item))
-
-    watch_hits = []
-    holding_hits = []
-    for g in rows:
-        c = clean_code(g.get("代码"))
-        n = str(g.get("股票", "")).strip()
-        if c in watch_codes or n in watch_names:
-            watch_hits.append(simple_row(g))
-        if c in holding_codes or n in holding_names:
-            holding_hits.append(simple_row(g))
-
-    positive_count = sum(1 for x in rows if x.get("龙虎榜净买额", 0) > 0)
-    negative_count = sum(1 for x in rows if x.get("龙虎榜净买额", 0) < 0)
-    flat_count = len(rows) - positive_count - negative_count
-
-    total_buy = sum(x.get("买入额", 0) for x in rows)
-    total_sell = sum(x.get("卖出额", 0) for x in rows)
-    total_net = sum(x.get("龙虎榜净买额", 0) for x in rows)
-
-    duplicate_stocks = [
-        {
-            "代码": x.get("代码"),
-            "股票": x.get("股票"),
-            "原始记录数": x.get("原始记录数"),
-            "上榜原因": "；".join(x.get("上榜原因列表", []))
-        }
-        for x in rows if x.get("原始记录数", 0) > 1
-    ]
-
-    if positive_count > negative_count and total_net > 0:
-        conclusion = "龙虎榜按去重个股统计后整体偏净流入，短线资金进攻意愿较强。"
-    elif negative_count > positive_count and total_net < 0:
-        conclusion = "龙虎榜按去重个股统计后整体偏净流出，部分高位票存在兑现压力。"
-    else:
-        conclusion = "龙虎榜按去重个股统计后多空分歧明显，资金并非单边进攻。"
+    def total(field):
+        values = [row[field] for row in rows if row[field] is not None]
+        return sum(values) if values else None
 
     return {
-        "龙虎榜完整统计": {
-            "日期": lhb_result.get("date"),
-            "模式": lhb_result.get("mode"),
-            "原始记录数": len(records),
-            "去重后个股数": len(rows),
-            "重复上榜个股数": len(duplicate_stocks),
-            "净买入个股数": positive_count,
-            "净卖出个股数": negative_count,
-            "净额接近零个股数": flat_count,
-            "合计买入额": total_buy,
-            "合计卖出额": total_sell,
-            "合计净买额": total_net,
-            "统计口径": "按股票代码去重聚合；同一股票多原因上榜时，买入额/卖出额/净买额合并统计。"
-        },
-        "重复上榜个股": duplicate_stocks[:limit] if duplicate_stocks else "暂无重复上榜个股",
-        "龙虎榜净买入前列": net_buy_top,
-        "龙虎榜净卖出前列": net_sell_top,
-        "龙虎榜涨幅前列": rise_top,
-        "龙虎榜跌幅前列": fall_top,
-        "观察池龙虎榜命中": watch_hits if watch_hits else "观察池暂无个股上榜",
-        "持仓池龙虎榜命中": holding_hits if holding_hits else "持仓池暂无个股上榜",
-        "龙虎榜资金方向判断": {
-            "结论": conclusion,
-            "盘后观察": [
-                "净买入前排是否与今日主线一致",
-                "上涨上榜但净卖出的股票，次日要防分歧",
-                "观察池/持仓池若上榜，重点看净买入还是净卖出",
-                "重复上榜个股要看是多原因强化，还是高波动导致反复上榜"
-            ]
-        }
+        "龙虎榜完整统计": {"日期": lhb_result.get("date"), "模式": lhb_result.get("mode"),
+            "原始记录数": len(records), "接口记录数": lhb_result.get("rows", len(records)),
+            "去重后个股数": len({row["代码"] for row in rows}), "去重后日期个股数": len(rows),
+            "重复上榜个股数": sum(row["原始记录数"] > 1 for row in rows),
+            "净买入个股数": sum(row["龙虎榜净买额"] > 0 for row in valid),
+            "净卖出个股数": sum(row["龙虎榜净买额"] < 0 for row in valid),
+            "净额接近零个股数": sum(row["龙虎榜净买额"] == 0 for row in valid),
+            "金额缺失或冲突数": len(rows) - len(valid), "合计买入额": total("买入额"),
+            "合计卖出额": total("卖出额"), "合计净买额": net,
+            "统计口径": "按日期和代码去重；重复金额只计一次，冲突金额剔除。合计仅含有效样本。"},
+        "龙虎榜净买入前列": [row for row in top("龙虎榜净买额", True) if row["龙虎榜净买额"] > 0],
+        "龙虎榜净卖出前列": [row for row in top("龙虎榜净买额", False) if row["龙虎榜净买额"] < 0],
+        "龙虎榜涨幅前列": top("涨跌幅", True), "龙虎榜跌幅前列": top("涨跌幅", False),
+        "观察池龙虎榜命中": hits(watch_items), "持仓池龙虎榜命中": hits(holding_items),
+        "龙虎榜资金方向判断": {"结论": conclusion}, "数据提示": list(dict.fromkeys(warnings)),
     }
 
 
@@ -2866,17 +3176,7 @@ def build_after_close_brief_judgement(idx, market_overview=None, watch_rows=None
 
     parts = [base]
 
-    def to_float(x):
-        try:
-            if x is None:
-                return None
-            if isinstance(x, str):
-                x = x.replace("%", "").replace(",", "").strip()
-                if x in {"", "-", "None", "nan"}:
-                    return None
-            return float(x)
-        except Exception:
-            return None
+    to_float = _to_float
 
     # 1. 市场真实温度
     up_count = None
@@ -2905,6 +3205,9 @@ def build_after_close_brief_judgement(idx, market_overview=None, watch_rows=None
                 down_count = to_float(market_overview.get(k))
                 break
 
+        if _to_float(width.get("总成交额_元")) is not None:
+            amount = _fmt_yi(width["总成交额_元"])
+
         # 成交额可能在概览内，也可能只有个股榜单里有，读不到就不强行写
         for k in ("成交额", "成交额_亿元", "total_amount", "amount"):
             if k in market_overview:
@@ -2920,7 +3223,7 @@ def build_after_close_brief_judgement(idx, market_overview=None, watch_rows=None
             parts.append("全A涨跌家数接近，市场分歧仍然存在。")
 
     if amount:
-        parts.append(f"成交额维持在{amount}附近，后续重点看量能能否继续支撑主线延续。")
+        parts.append(f"有效行情样本成交额合计{amount}；缺少上一交易日对照，不判断量能增减。")
 
     # 2. 观察池 / 持仓池表现
     def top_stock(rows):
@@ -2934,7 +3237,7 @@ def build_after_close_brief_judgement(idx, market_overview=None, watch_rows=None
                 valid.append((pct, name))
         if not valid:
             return None
-        valid.sort(reverse=True)
+        valid.sort(key=lambda item: item[0], reverse=True)
         return valid[0]
 
     w_top = top_stock(watch_rows)
@@ -2970,11 +3273,85 @@ def build_after_close_brief_judgement(idx, market_overview=None, watch_rows=None
     return "".join(parts)
 
 
+def _normalize_report_date(value=None):
+    if value is None:
+        return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+    raw = str(value).strip().replace("-", "").replace("/", "")
+    if not re.fullmatch(r"\d{8}", raw):
+        raise ValueError("复盘日期必须为 YYYYMMDD 或 YYYY-MM-DD")
+    parsed = datetime.strptime(raw, "%Y%m%d")
+    if parsed.date() > datetime.now(ZoneInfo("Asia/Shanghai")).date():
+        raise ValueError("不能生成未来日期的复盘")
+    return raw
+
+
+def _historical_quote_for_report(symbol, date, *, index_code=None):
+    """Fetch exactly the requested daily bar; never replace missing history with live data."""
+    code = str(symbol).removeprefix("sh").removeprefix("sz")
+    target = datetime.strptime(date, "%Y%m%d")
+    try:
+        # Bounded request using the same Eastmoney daily-bar schema as the installed provider.
+        secid = ("1." if index_code.startswith("sh") else "0.") + code if index_code else get_secid(code)
+        response = requests.get(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={"secid": secid, "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                    "klt": "101", "fqt": "0", "beg": date, "end": date},
+            headers=HEADERS, timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json().get("data") or {}
+        for raw in payload.get("klines", []):
+            fields = raw.split(",")
+            if len(fields) >= 10 and fields[0] == target.strftime("%Y-%m-%d"):
+                return {"代码": code, "名称": payload.get("name") or code,
+                        "收盘价": _to_float(fields[2]), "涨跌幅%": _to_float(fields[8]),
+                        "今开": _to_float(fields[1]), "最高": _to_float(fields[3]),
+                        "最低": _to_float(fields[4]), "成交额": _to_float(fields[6]),
+                        "数据时间": fields[0] + " 15:00:00", "数据源": "东方财富历史日线（不复权）"}
+        return {"代码": code, "error": f"{date} 无日线数据（休市、停牌或接口缺失）"}
+    except Exception:
+        return {"代码": code, "error": f"{date} 历史日线不可用"}
+
+
+def _dated_report_quote(row, date):
+    if not isinstance(row, dict) or row.get("error"):
+        return row
+    row = dict(row)
+    price = _to_float(row.get("最新价") if row.get("最新价") is not None else row.get("收盘价"))
+    if price is None or price <= 0:
+        row["error"] = "行情价格缺失或无效，未参与盘后判断"
+        return row
+    stamp = str(row.get("数据时间") or row.get("时间") or "")
+    actual = stamp[:10].replace("-", "")
+    if actual != date:
+        row["error"] = f"行情日期 {stamp or '未知'} 与复盘日期 {date} 不一致，未参与判断"
+    elif len(stamp) < 19 or stamp[11:19] < "15:00:00":
+        row["error"] = f"行情尚未收盘（{stamp}），未参与盘后判断"
+    return row
+
+
 def after_close_report(date=None, symbol=None, include_lhb=False, emit=True):
+    date = _normalize_report_date(date)
+    historical = date != _normalize_report_date()
     sections = {}
+    warnings = ["观察池与持仓池采用当前名单，不代表该历史日期的持仓。"] if historical else []
+    quote_cache = {}
+
+    def report_quote(code):
+        if code not in quote_cache:
+            row = _historical_quote_for_report(code, date) if historical else _safe_quote_for_report(code)
+            quote_cache[code] = _dated_report_quote(row, date)
+        return dict(quote_cache[code])
+
 
     try:
-        idx = index_sina()
+        if historical:
+            idx = [_historical_quote_for_report(code, date, index_code=prefix + code)
+                   for prefix, code in [("sh", "000001"), ("sz", "399001"), ("sz", "399006"), ("sh", "000688"), ("sh", "000016")]]
+        else:
+            idx = index_sina()
+        idx = [_dated_report_quote(row, date) for row in idx]
         sections["指数概览"] = idx
     except Exception as e:
         idx = []
@@ -2982,7 +3359,8 @@ def after_close_report(date=None, symbol=None, include_lhb=False, emit=True):
 
     # 全A市场数据：新浪全A接口，失败不拖垮报告
     try:
-        sections["全A市场概览"] = market_overview_sina(limit=10)
+        sections["全A市场概览"] = ({"error": "历史全A市场宽度不可用；不会使用今日快照替代"}
+                                  if historical else market_overview_sina(limit=10))
     except Exception as e:
         sections["全A市场概览"] = {"error": "暂缺（全A行情接口不可用）", "details": str(e)}
 
@@ -2990,7 +3368,7 @@ def after_close_report(date=None, symbol=None, include_lhb=False, emit=True):
     etf_symbols = ["510050", "510300", "510500", "159915", "512000"]
     etf_rows = []
     for s in etf_symbols:
-        etf_rows.append(_safe_quote_for_report(s))
+        etf_rows.append(report_quote(s))
     sections["指数ETF观察"] = etf_rows
 
     # 观察池 / 持仓池：读取 ~/.openclaw/market_watchlist.json
@@ -3010,7 +3388,7 @@ def after_close_report(date=None, symbol=None, include_lhb=False, emit=True):
     watch_rows = []
     for item in watch_items:
         code = item.get("code") if isinstance(item, dict) else str(item)
-        row = _safe_quote_for_report(code)
+        row = report_quote(code)
         if isinstance(row, dict) and isinstance(item, dict):
             row["观察池名称"] = item.get("name", code)
             row["备注"] = item.get("note", "")
@@ -3019,7 +3397,7 @@ def after_close_report(date=None, symbol=None, include_lhb=False, emit=True):
     holding_rows = []
     for item in holding_items:
         code = item.get("code") if isinstance(item, dict) else str(item)
-        row = _safe_quote_for_report(code)
+        row = report_quote(code)
         if isinstance(row, dict) and isinstance(item, dict):
             row["持仓名称"] = item.get("name", code)
             row["备注"] = item.get("note", "")
@@ -3049,7 +3427,7 @@ def after_close_report(date=None, symbol=None, include_lhb=False, emit=True):
     if symbol:
         sections["观察对象"] = {
             "symbol": symbol,
-            "行情": _safe_quote_for_report(symbol)
+            "行情": report_quote(symbol)
         }
     else:
         sections["观察对象"] = {
@@ -3061,7 +3439,7 @@ def after_close_report(date=None, symbol=None, include_lhb=False, emit=True):
 
     if include_lhb:
         try:
-            lhb_result = lhb(symbol=symbol, emit=False) if symbol else lhb(emit=False)
+            lhb_result = lhb(date=date, symbol=symbol, emit=False)
             sections["龙虎榜摘要"] = summarize_lhb_records(lhb_result)
             sections["龙虎榜增强分析"] = analyze_lhb_enhanced(
                 lhb_result,
@@ -3091,16 +3469,18 @@ def after_close_report(date=None, symbol=None, include_lhb=False, emit=True):
         sections["龙虎榜摘要"] = "已跳过（默认不启用）"
 
     sections["简短判断"] = build_after_close_brief_judgement(
-        idx,
+        [row for row in idx if isinstance(row, dict) and not row.get("error")],
         market_overview=sections.get("全A市场概览"),
-        watch_rows=watch_rows,
-        holding_rows=holding_rows,
+        watch_rows=[row for row in watch_rows if not row.get("error")],
+        holding_rows=[row for row in holding_rows if not row.get("error")],
         lhb_enhanced=sections.get("龙虎榜增强分析")
     )
 
     result = {
         "report_type": "after_close_report",
-        "date": date or datetime.now().strftime("%Y%m%d"),
+        "date": date,
+        "symbol": symbol,
+        "warnings": warnings,
         "sections": sections
     }
     if emit:
@@ -3130,9 +3510,12 @@ STOCK_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 def classify_after_close_intent(text):
     """Classify review requests before broad natural-language matching."""
     normalized = " ".join(str(text).strip().split())
+    # Pool mutations carry stock codes too; leave them to their state-changing router.
+    if any(pool in normalized for pool in ("观察池", "关注池", "自选池", "持仓池", "持仓")) and any(action in normalized for action in ("加入", "新增", "删除", "移除")):
+        return {"intent": "other", "pool_mutation": True}
     code_match = STOCK_CODE_RE.search(normalized)
     stock_code = code_match.group(1) if code_match else None
-    has_market_scope = any(k in normalized for k in MARKET_SCOPE_KEYWORDS)
+    has_market_scope = any(k in normalized for k in ("整体", "大盘", "全市场", "市场整体"))
     has_holding_scope = any(k in normalized for k in HOLDING_SCOPE_KEYWORDS)
     has_stock_scope = any(k in normalized for k in STOCK_SCOPE_KEYWORDS)
     has_review_word = any(k in normalized for k in ("复盘", "盘后", "收盘总结", "盘后总结"))
@@ -3145,6 +3528,9 @@ def classify_after_close_intent(text):
 
     if has_holding_scope and has_review_word:
         return {"intent": "holding_review"}
+
+    if has_review_word and "个股" in normalized:
+        return {"intent": "stock_review", "needs_stock_code": True}
 
     if "股票代码" in normalized or "某只股票" in normalized:
         return {"intent": "stock_review", "needs_stock_code": True}
@@ -3165,6 +3551,11 @@ def handle_natural_language_command(text):
     text = " ".join(str(text).strip().split())
     if not text:
         return {"error": "空命令"}
+    codex_action = {
+        "开启codex流量": "on", "关闭codex流量": "off", "codex流量状态": "status",
+    }.get(re.sub(r"\s+", "", text).casefold())
+    if codex_action:
+        return model_codex_control(codex_action)
 
     name_code_map = {
         "中芯国际": "688981",
@@ -3315,11 +3706,13 @@ def handle_natural_language_command(text):
     }:
         return monitor_diagnose()
 
-    if text in {"测试盯盘提醒", "微信通知测试", "测试微信盯盘提醒"}:
+    if text in {"微信通知测试", "测试微信盯盘提醒"}:
         return monitor_notify_test("weixin")
+    if text == "测试盯盘提醒":
+        return monitor_notify_test()
 
     if text in {"模拟盯盘提醒", "模拟触发普通盯盘", "测试普通盯盘模拟提醒"}:
-        return monitor_simulate_alert("weixin")
+        return monitor_simulate_alert()
 
     simulate_match = re.search(
         r"(?:模拟触发策略盯盘|策略盯盘模拟验证)\s*([036]\d{5})?",
@@ -3329,12 +3722,9 @@ def handle_natural_language_command(text):
         return strategy_simulate(simulate_match.group(1) or "510050")
 
     if text in {"启动策略盯盘", "开启策略盯盘", "执行策略盯盘", "运行策略盯盘"}:
-        set_result = monitor_set(
-            True,
-            mode="strategy",
-            source_channel=_default_output_channel(),
-            notify_channels=_normalize_notify_channels({}, include_fallback=True),
-        )
+        set_result = monitor_set(True, mode="strategy")
+        if not set_result.get("ok"):
+            return set_result
         start_result = monitor_start()
         verify_result = monitor_verify(expected_running=True, wait_seconds=1.2)
         trading_status = trading_time_status()
@@ -3368,12 +3758,9 @@ def handle_natural_language_command(text):
         "启动省流盯盘", "启动标准盯盘", "启动严密盯盘"
     }
     if text.lower() in normal_monitor_commands or text in normal_monitor_commands:
-        set_result = monitor_set(
-            True,
-            mode="normal",
-            source_channel=_default_output_channel(),
-            notify_channels=_normalize_notify_channels({}, include_fallback=True),
-        )
+        set_result = monitor_set(True, mode="normal")
+        if not set_result.get("ok"):
+            return set_result
         start_result = monitor_start()
         verify_result = monitor_verify(expected_running=True, wait_seconds=1.2)
         return {
@@ -3385,12 +3772,9 @@ def handle_natural_language_command(text):
         }
 
     if text in {"启动盯盘", "启动后台盯盘", "开始后台盯盘"}:
-        monitor_set(
-            True,
-            mode="normal",
-            source_channel=_default_output_channel(),
-            notify_channels=_normalize_notify_channels({}, include_fallback=True),
-        )
+        set_result = monitor_set(True, mode="normal")
+        if not set_result.get("ok"):
+            return set_result
         start_result = monitor_start()
         verify_result = monitor_verify(expected_running=True, wait_seconds=1.2)
         return {"ok": bool(verify_result.get("verified")), "action": "start_monitor_current_mode", "start": start_result, "verify": verify_result}
@@ -3419,6 +3803,12 @@ def handle_natural_language_command(text):
 
     # 盘后复盘必须先做确定性分类，不能仅凭“复盘”追问股票代码。
     review_intent = classify_after_close_intent(text)
+    if not review_intent.get("pool_mutation") and any(word in text for word in ("复盘", "盘后", "收盘总结")) and not any(word in text for word in ("整体", "大盘", "全市场")):
+        named_codes = [code for name, code in name_code_map.items() if name in text]
+        if len(set(named_codes)) == 1 and not review_intent.get("stock_code"):
+            review_intent = {"intent": "stock_review", "stock_code": named_codes[0]}
+    date_match = re.search(r"(?<!\d)(\d{4}[-/]?\d{2}[-/]?\d{2})(?!\d)", text)
+    review_date = date_match.group(1) if date_match else None
     intent = review_intent.get("intent")
 
     if text in {"来个完整版", "来份完整版", "给我完整版", "完整版", "完整版本", "详细版"}:
@@ -3429,14 +3819,10 @@ def handle_natural_language_command(text):
 
     if intent == "market_after_close":
         variant = "simple" if any(x in text for x in ("简版", "简洁", "简单")) else "full"
-        return report_output("after_close_report", variant=variant, channel=_default_output_channel())
+        return report_output("after_close_report", variant=variant, channel=_default_output_channel(), date=review_date)
 
     if intent == "mixed_review":
-        return {
-            "intent": "mixed_review",
-            "needs_clarification": True,
-            "message": "您要的是整体大盘盘后复盘。是否还需要把持仓/个股一起纳入？"
-        }
+        return report_output("after_close_report", variant="full", channel=_default_output_channel(), date=review_date)
 
     if intent == "holding_review":
         holding_items = load_watchlist_config().get("holding_pool", []) or []
@@ -3446,7 +3832,7 @@ def handle_natural_language_command(text):
                 "needs_stock_code": True,
                 "message": "当前没有持仓列表，请提供持仓股票代码。"
             }
-        result = report_output("after_close_report", variant="full", channel=_default_output_channel())
+        result = report_output("after_close_report", variant="full", channel=_default_output_channel(), date=review_date, scope="holding_pool")
         if isinstance(result, dict):
             result["review_scope"] = "holding_pool"
         return result
@@ -3466,7 +3852,7 @@ def handle_natural_language_command(text):
             }
         if intent == "stock_review":
             return report_output(
-                "after_close_report", variant="full", channel=_default_output_channel(), symbol=stock_code
+                "after_close_report", variant="full", channel=_default_output_channel(), symbol=stock_code, date=review_date
             )
         return {
             "report_type": "stock_quote",
@@ -3566,7 +3952,9 @@ def after_close_report_simple(date=None, symbol=None):
     if "简短判断" in sections:
         simple_sections["核心判断"] = sections.get("简短判断")
 
-    if "主要指数" in sections:
+    if "指数概览" in sections:
+        simple_sections["主要指数"] = sections.get("指数概览")
+    elif "主要指数" in sections:
         simple_sections["主要指数"] = sections.get("主要指数")
     elif "指数表现" in sections:
         simple_sections["主要指数"] = sections.get("指数表现")
@@ -3614,59 +4002,799 @@ def after_close_report_simple(date=None, symbol=None):
 
     return {
         "report_type": "after_close_report_simple",
+        "date": full.get("date"),
         "title": "A股简洁盘后复盘",
         "说明": "默认复盘输出简洁版，仅保留核心判断、指数、市场温度、观察池/持仓池和龙虎榜简析；如需完整明细，可发送“来个完整版”。",
         "sections": simple_sections
     }
 
 
-def report_output(report_type, variant="full", channel="telegram", date=None, symbol=None):
-    """Collect data, build structured analysis, and render a fixed template."""
+def report_output(report_type, variant="full", channel="telegram", date=None, symbol=None, scope=None):
+    """Collect once, preserve diagnostics and distinguish incomplete data from success."""
     try:
+        adapter = get_channel_adapter(channel)
+    except ValueError:
+        return {"ok": False, "error": "不支持的报告通道", "pipeline": {"channel_result": {"ok": False}}}
+    try:
+        if variant not in {"full", "simple"}:
+            raise ValueError("报告版本必须为 full 或 simple")
         if report_type == "morning_report":
+            if date and _normalize_report_date(date) != _normalize_report_date():
+                raise ValueError("盘前新闻不支持历史日期回放，不能用当前新闻替代")
             data = morning_report(emit=False)
         elif report_type == "after_close_report":
             data = after_close_report(date=date, symbol=symbol, include_lhb=True, emit=False)
         else:
-            raise ValueError(f"未知报告类型：{report_type}")
+            raise ValueError("未知报告类型")
+        if scope:
+            data["review_scope"] = scope
         rendered = render_report(data, report_type, variant=variant, channel=channel)
-        return {
-            "ok": True,
-            "pipeline": {
-                "collection_result": {"ok": True, "report_type": report_type},
-                "analysis_result": {"ok": True, "schema_version": rendered["analysis"].get("schema_version")},
-                "template_result": {"ok": True, "variant": variant},
-                "channel_result": {"ok": True, "channel": channel},
-            },
-            "analysis": rendered["analysis"],
-            "_output_format": "text",
-            "text": rendered["text"],
-        }
+        complete = rendered["analysis"]["status"] == "OK"
+        return {"ok": True, "partial": not complete,
+            "pipeline": {"collection_result": {"ok": complete, "report_type": report_type},
+                         "analysis_result": {"ok": True, "schema_version": rendered["analysis"].get("schema_version")},
+                         "template_result": {"ok": True, "variant": variant},
+                         "channel_result": {"ok": True, "channel": channel}},
+            "analysis": rendered["analysis"], "_output_format": "text", "text": rendered["text"]}
     except Exception as exc:
-        rendered = render_report({}, report_type, variant=variant, channel=channel)
-        rendered["analysis"]["warnings"].append(f"报告流水线异常：{exc}")
-        rendered = render_report(
-            {"sections": {}}, report_type, variant=variant, channel=channel
-        )
-        return {
-            "ok": False,
-            "error": str(exc),
-            "pipeline": {
-                "collection_result": {"ok": False, "error": str(exc)},
-                "analysis_result": {"ok": True, "fallback_used": True},
-                "template_result": {"ok": True, "variant": variant},
-                "channel_result": {"ok": True, "channel": channel},
-            },
-            "analysis": rendered["analysis"],
-            "_output_format": "text",
-            "text": rendered["text"],
-        }
+        # Exception payloads may contain URLs/tokens; expose a class and safe validation messages only.
+        reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+        analysis = fallback_analysis(report_type, variant, "报告流水线失败：" + reason)
+        return {"ok": False, "error": reason,
+            "pipeline": {"collection_result": {"ok": False}, "analysis_result": {"ok": False, "fallback_used": True},
+                         "template_result": {"ok": True, "variant": variant}, "channel_result": {"ok": True, "channel": channel}},
+            "analysis": analysis, "_output_format": "text", "text": adapter.render_report(analysis)}
 
 
 
 MONITOR_STATE_PATH = _state_path("market_monitor_state.json")
 MONITOR_STATE_LOCK_PATH = _state_path("market_monitor_state.lock")
 STRATEGY_SELFCHECK_STATE_PATH = _state_path("strategy_selfcheck_state.json")
+
+
+
+_MONITOR_STATE_MAX_BYTES = 4 * 1024 * 1024
+_MONITOR_STATE_MARKER = b'monitor-state-initialized-v1\n'
+_MONITOR_STATE_OBSERVED_PATHS = set()
+_MONITOR_STATE_SYNCED_MARKERS = {}
+
+class MonitorStateBlocked(RuntimeError):
+    """A safe, fixed diagnostic: never include file contents or OS error text."""
+    def __init__(self, code):
+        self.code = code
+        super().__init__('盯盘状态不可用，已停止扫描及发送；保留原文件，需检查或恢复状态。')
+
+    def as_status(self):
+        return {'ok': False, 'blocked': True, 'code': self.code,
+                'message': str(self), 'recovery_required': True}
+
+
+def _monitor_state_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _monitor_state_lstat(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise MonitorStateBlocked('state_access_failed') from None
+
+
+def _monitor_state_check_file(info):
+    if not stat.S_ISREG(info.st_mode):
+        raise MonitorStateBlocked('state_not_regular')
+    if info.st_uid != os.getuid() or info.st_nlink != 1:
+        raise MonitorStateBlocked('state_ownership_invalid')
+    if info.st_mode & 0o022:
+        raise MonitorStateBlocked('state_permissions_unsafe')
+
+
+def _monitor_state_read_bytes(path, limit):
+    before = _monitor_state_lstat(path)
+    if before is None:
+        return None, None
+    _monitor_state_check_file(before)
+    if before.st_size > limit:
+        raise MonitorStateBlocked('state_too_large')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, 'rb') as handle:
+            opened = os.fstat(handle.fileno())
+            _monitor_state_check_file(opened)
+            if _monitor_state_identity(before) != _monitor_state_identity(opened):
+                raise MonitorStateBlocked('state_changed_during_read')
+            raw = handle.read(limit + 1)
+            after = os.fstat(handle.fileno())
+        current = _monitor_state_lstat(path)
+        if (len(raw) > limit or current is None or
+                _monitor_state_identity(opened) != _monitor_state_identity(after) or
+                _monitor_state_identity(opened) != _monitor_state_identity(current)):
+            raise MonitorStateBlocked('state_changed_during_read')
+        return raw, current
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        raise MonitorStateBlocked('state_access_failed') from None
+
+
+def _monitor_state_fsync_directory():
+    directory = os.path.dirname(os.path.abspath(MONITOR_STATE_PATH))
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise MonitorStateBlocked('state_directory_sync_failed') from None
+
+
+def _monitor_state_marker_present():
+    raw, _ = _monitor_state_read_bytes(MONITOR_STATE_PATH + '.initialized', 128)
+    if raw is None:
+        return False
+    if raw != _MONITOR_STATE_MARKER:
+        raise MonitorStateBlocked('state_marker_invalid')
+    return True
+
+
+def _monitor_state_ensure_marker():
+    if _monitor_state_marker_present():
+        _monitor_state_confirm_marker_sync()
+        return
+    path = MONITOR_STATE_PATH + '.initialized'
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        if not _monitor_state_marker_present():
+            raise MonitorStateBlocked('state_marker_invalid')
+        _monitor_state_confirm_marker_sync()
+        return
+    except OSError:
+        raise MonitorStateBlocked('state_marker_write_failed') from None
+    try:
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(_MONITOR_STATE_MARKER)
+            handle.flush()
+            os.fsync(handle.fileno())
+            created_identity = _monitor_state_identity(os.fstat(handle.fileno()))
+        _monitor_state_fsync_directory()
+        raw, info = _monitor_state_read_bytes(path, 128)
+        if raw != _MONITOR_STATE_MARKER or info is None or _monitor_state_identity(info) != created_identity:
+            raise MonitorStateBlocked('state_marker_invalid')
+        _MONITOR_STATE_SYNCED_MARKERS[os.path.abspath(path)] = _monitor_state_identity(info)
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        # Keep even an incomplete marker: initialization must not silently retry empty.
+        raise MonitorStateBlocked('state_marker_write_failed') from None
+
+
+def _monitor_state_confirm_marker_sync():
+    path = MONITOR_STATE_PATH + '.initialized'
+    raw, info = _monitor_state_read_bytes(path, 128)
+    if raw != _MONITOR_STATE_MARKER or info is None:
+        raise MonitorStateBlocked('state_marker_invalid')
+    key = os.path.abspath(path)
+    identity = _monitor_state_identity(info)
+    if _MONITOR_STATE_SYNCED_MARKERS.get(key) == identity:
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+        try:
+            if _monitor_state_identity(os.fstat(descriptor)) != identity:
+                raise MonitorStateBlocked('state_marker_invalid')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _monitor_state_fsync_directory()
+        current = _monitor_state_lstat(path)
+        if current is None or _monitor_state_identity(current) != identity:
+            raise MonitorStateBlocked('state_marker_invalid')
+        _MONITOR_STATE_SYNCED_MARKERS[key] = identity
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        raise MonitorStateBlocked('state_marker_sync_failed') from None
+
+
+def _monitor_state_finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return False
+    try:
+        return math.isfinite(float(value)) and float(value) >= 0
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _validate_monitor_state(data):
+    if not isinstance(data, dict):
+        raise MonitorStateBlocked('state_schema_invalid')
+    revision = data.get('revision', 0)
+    if type(revision) is not int or revision < 0:
+        raise MonitorStateBlocked('state_schema_invalid')
+    # Never infer missing deduplication maps from a partially valid JSON file.
+    for key in ('last_alerts', 'last_quotes', 'strategy_active'):
+        if key not in data or not isinstance(data[key], dict):
+            raise MonitorStateBlocked('state_schema_invalid')
+    if any(not isinstance(key, str) or not key or not _monitor_state_finite_number(value)
+           for key, value in data['last_alerts'].items()):
+        raise MonitorStateBlocked('state_schema_invalid')
+    active = data.get('strategy_active', {})
+    if not isinstance(active, dict) or any(not isinstance(key, str) or not key or type(value) is not bool
+                                          for key, value in active.items()):
+        raise MonitorStateBlocked('state_schema_invalid')
+    for key, quote in data['last_quotes'].items():
+        if not isinstance(key, str) or not key or not isinstance(quote, dict):
+            raise MonitorStateBlocked('state_schema_invalid')
+        if 'ts' in quote and not _monitor_state_finite_number(quote['ts']):
+            raise MonitorStateBlocked('state_schema_invalid')
+        for field in ('price', 'pct', 'amplitude_percent', 'volume_ratio', 'turnover_rate_percent'):
+            value = quote.get(field)
+            if value is not None:
+                try:
+                    if isinstance(value, bool) or not isinstance(value, (int, float, str)) or not math.isfinite(float(value)):
+                        raise MonitorStateBlocked('state_schema_invalid')
+                except (ValueError, TypeError, OverflowError):
+                    raise MonitorStateBlocked('state_schema_invalid') from None
+        for field in ('name', 'pool', 'mode', 'data_time', 'time'):
+            if quote.get(field) is not None and not isinstance(quote[field], str):
+                raise MonitorStateBlocked('state_schema_invalid')
+    for key in ('last_checked_symbols', 'last_alert_candidates', 'last_suppressed'):
+        value = data.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+            raise MonitorStateBlocked('state_schema_invalid')
+    unavailable = data.get('strategy_last_unavailable', [])
+    if not isinstance(unavailable, list) or any(not isinstance(item, str) for item in unavailable):
+        raise MonitorStateBlocked('state_schema_invalid')
+    for key in ('last_scan_at', 'last_quote_at', 'updated_at'):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            raise MonitorStateBlocked('state_schema_invalid')
+    notification = data.get('last_notify_result')
+    if notification is not None:
+        if not isinstance(notification, dict):
+            raise MonitorStateBlocked('state_schema_invalid')
+        results = notification.get('results', [])
+        if not isinstance(results, list) or any(not isinstance(item, dict) for item in results):
+            raise MonitorStateBlocked('state_schema_invalid')
+        if 'ok' in notification and type(notification['ok']) is not bool:
+            raise MonitorStateBlocked('state_schema_invalid')
+        if 'partial' in notification and type(notification['partial']) is not bool:
+            raise MonitorStateBlocked('state_schema_invalid')
+        for field in ('successful_channels', 'failed_channels', 'notify_channels'):
+            value = notification.get(field, [])
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise MonitorStateBlocked('state_schema_invalid')
+        for result in results:
+            if ('ok' in result and type(result['ok']) is not bool or
+                    result.get('channel') is not None and not isinstance(result['channel'], str)):
+                raise MonitorStateBlocked('state_schema_invalid')
+    # Reject non-JSON values and all non-finite numbers, including nested diagnostics.
+    try:
+        json.dumps(data, ensure_ascii=False, allow_nan=False)
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        raise MonitorStateBlocked('state_schema_invalid') from None
+    normalized = dict(data)
+    normalized.setdefault('revision', 0)
+    normalized.setdefault('strategy_active', {})
+    for key in ('last_checked_symbols', 'last_alert_candidates', 'last_suppressed'):
+        normalized.setdefault(key, [])
+    return normalized
+
+
+def _monitor_state_object_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise MonitorStateBlocked('state_json_invalid')
+        result[key] = value
+    return result
+
+
+def _monitor_state_snapshot(history_expected=False):
+    marker_present = _monitor_state_marker_present()
+    path_key = os.path.abspath(MONITOR_STATE_PATH)
+    before = _monitor_state_lstat(MONITOR_STATE_PATH)
+    if before is None:
+        anchors = (MONITOR_STATE_PATH + '.delivery.json',
+                   MONITOR_STATE_PATH + '.delivery.json.initialized')
+        if (history_expected or marker_present or path_key in _MONITOR_STATE_OBSERVED_PATHS or
+                any(_monitor_state_lstat(path) is not None for path in anchors)):
+            raise MonitorStateBlocked('state_missing_after_initialization')
+        return _validate_monitor_state(_default_monitor_state()), None
+    _MONITOR_STATE_OBSERVED_PATHS.add(path_key)
+    raw, identity = _monitor_state_read_bytes(MONITOR_STATE_PATH, _MONITOR_STATE_MAX_BYTES)
+    if raw is None:
+        raise MonitorStateBlocked('state_changed_during_read')
+    try:
+        data = json.loads(raw, object_pairs_hook=_monitor_state_object_pairs,
+                          parse_constant=lambda _: (_ for _ in ()).throw(MonitorStateBlocked('state_json_invalid')))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise MonitorStateBlocked('state_json_invalid') from None
+    state = _validate_monitor_state(data)
+    # Valid legacy-state migration only: corrupt bytes are preserved without a marker write.
+    _monitor_state_ensure_marker()
+    return state, identity
+
+
+@contextlib.contextmanager
+def _locked_monitor_state():
+    directory = os.path.dirname(os.path.abspath(MONITOR_STATE_LOCK_PATH))
+    try:
+        os.makedirs(directory, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0)
+        descriptor = os.open(MONITOR_STATE_LOCK_PATH, flags, 0o600)
+        with os.fdopen(descriptor, 'a+b') as handle:
+            _monitor_state_check_file(os.fstat(handle.fileno()))
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                current = _monitor_state_lstat(MONITOR_STATE_LOCK_PATH)
+                opened = os.fstat(handle.fileno())
+                if current is None or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise MonitorStateBlocked('state_lock_changed')
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        raise MonitorStateBlocked('state_lock_unavailable') from None
+
+
+
+
+
+
+def _openclaw_message_confirmed(payload, provider_channel):
+    """Accept a send receipt, never infer delivery from successful JSON parsing.
+
+    The installed CLI wraps send results in action/channel/dryRun/handledBy/payload.
+    Nested failure, suppression, dry-run or uncertain status overrides a receipt.
+    This confirms the provider operation, not that a human read the message.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if (payload.get("action") != "send" or payload.get("channel") != provider_channel
+            or payload.get("dryRun") is not False
+            or payload.get("handledBy") not in ("core", "plugin")
+            or not isinstance(payload.get("payload"), dict)):
+        return False
+    pending = [(payload, 0)]
+    confirmed = False
+    visited = 0
+    while pending:
+        item, depth = pending.pop()
+        visited += 1
+        if visited > 256 or depth > 8:
+            return False
+        if (item.get("ok") is False or item.get("success") is False
+                or item.get("error") or item.get("isError") is True
+                or item.get("dryRun") is True or item.get("sentBeforeError") is True):
+            return False
+        for key in ("deliveryStatus", "delivery_status", "status"):
+            if key in item:
+                if item[key] not in ("sent", "delivered"):
+                    return False
+                confirmed = confirmed or depth > 0
+        if depth > 0 and (item.get("ok") is True or item.get("success") is True):
+            confirmed = True
+        message_id = item.get("messageId")
+        if ((isinstance(message_id, str) and message_id.strip())
+                or (type(message_id) is int and message_id > 0)):
+            confirmed = True
+        for key in ("payload", "result"):
+            child = item.get(key)
+            if isinstance(child, dict):
+                pending.append((child, depth + 1))
+        for key in ("results", "payloadOutcomes"):
+            children = item.get(key)
+            if isinstance(children, list):
+                if any(not isinstance(child, dict) for child in children):
+                    return False
+                pending.extend((child, depth + 1) for child in children)
+    return confirmed
+
+
+def _run_openclaw_notification(cmd, channel, provider_channel):
+    """Return explicit delivery semantics without exposing provider output."""
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=25)
+    except (FileNotFoundError, PermissionError) as exc:
+        # These exec failures happen before a child can submit the notification.
+        return {"ok": False, "channel": channel, "delivery_status": "not_sent",
+                "attempted": False, "error": _safe_error_summary(exc)}
+    except Exception as exc:
+        # Timeout/read/decoding errors can occur after provider acceptance.
+        return {"ok": False, "channel": channel, "delivery_status": "unknown",
+                "attempted": True, "error": _safe_error_summary(exc)}
+    if proc.returncode != 0:
+        # OpenClaw can fail in post-send hooks or bookkeeping after acceptance.
+        return {"ok": False, "channel": channel, "delivery_status": "unknown",
+                "attempted": True, "returncode": proc.returncode,
+                "error": _safe_error_summary(proc.stderr or proc.stdout)}
+    try:
+        payload = json.loads(proc.stdout or "")
+    except (ValueError, TypeError):
+        payload = None
+    if not isinstance(payload, dict):
+        return {"ok": False, "channel": channel, "delivery_status": "unknown",
+                "attempted": True, "error": "通知返回格式无效；无法确认发送结果，请勿自动重发。"}
+    if not _openclaw_message_confirmed(payload, provider_channel):
+        return {"ok": False, "channel": channel, "delivery_status": "unknown",
+                "attempted": True, "error": "通知服务未明确确认发送成功；请核实送达结果，勿自动重发。"}
+    return {"ok": True, "channel": channel, "provider_channel": provider_channel,
+            "delivery_status": "delivered", "attempted": True,
+            "response": {"ok": True}}
+
+
+
+
+
+
+
+
+
+
+
+
+class MonitorDeliveryBlocked(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def _monitor_delivery_path():
+    return MONITOR_STATE_PATH + ".delivery.json"
+
+
+def _delivery_blocked(code="delivery_state_unavailable"):
+    return {"ok": False, "blocked": True, "delivery_status": "unknown",
+            "error": code,
+            "message": "投递状态尚未确认，已暂停通知。请运行 monitor delivery status 核查并人工确认；不会自动重发。"}
+
+
+def _delivery_private_file(path, flags):
+    fd = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), 0o600)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+        os.close(fd)
+        raise MonitorDeliveryBlocked("delivery_file_unsafe")
+    return fd
+
+
+def _delivery_sync_dir():
+    fd = os.open(os.path.dirname(_monitor_delivery_path()), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _monitor_delivery_lock():
+    os.makedirs(os.path.dirname(_monitor_delivery_path()), exist_ok=True)
+    fd = _delivery_private_file(_monitor_delivery_path() + ".lock", os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise MonitorDeliveryBlocked("delivery_busy")
+        yield
+    finally:
+        os.close(fd)
+
+
+def _delivery_validate_marker():
+    try:
+        fd = _delivery_private_file(_monitor_delivery_path() + ".initialized", os.O_RDONLY)
+    except FileNotFoundError:
+        raise MonitorDeliveryBlocked("delivery_marker_missing")
+    try:
+        if os.read(fd, 4) != b"1\n":
+            raise MonitorDeliveryBlocked("delivery_marker_invalid")
+    finally:
+        os.close(fd)
+
+
+def _delivery_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _delivery_json_constant(value):
+    raise ValueError("nonfinite JSON constant")
+
+
+def _validate_monitor_delivery_data(data):
+    def timestamp(value):
+        return type(value) in {int, float} and math.isfinite(value) and value >= 0
+
+    if (not isinstance(data, dict) or set(data) != {"version", "transactions"}
+            or type(data.get("version")) is not int or data["version"] != 1
+            or not isinstance(data.get("transactions"), list)):
+        raise ValueError()
+    ids = set()
+    active = 0
+    for index, entry in enumerate(data["transactions"]):
+        if (not isinstance(entry, dict)
+                or set(entry) - {"id", "state", "created_at", "alerts", "channels", "completed_at"}
+                or not isinstance(entry.get("id"), str)
+                or not re.fullmatch(r"[0-9a-f]{32}", entry["id"]) or entry["id"] in ids):
+            raise ValueError()
+        ids.add(entry["id"])
+        if entry.get("state") not in {"active", "complete"} or not timestamp(entry.get("created_at")):
+            raise ValueError()
+        active += entry["state"] == "active"
+        if entry["state"] == "active" and (index != len(data["transactions"]) - 1 or "completed_at" in entry):
+            raise ValueError()
+        if entry["state"] == "complete" and not timestamp(entry.get("completed_at")):
+            raise ValueError()
+        if not isinstance(entry.get("alerts"), list) or not isinstance(entry.get("channels"), list) or not entry["channels"]:
+            raise ValueError()
+        channels = set()
+        for channel in entry["channels"]:
+            if (not isinstance(channel, dict)
+                    or set(channel) - {"channel", "status", "attempted_at", "confirmed_at", "resolved_at", "resolution"}
+                    or channel.get("channel") not in {"telegram", "weixin", "qq"}
+                    or channel["channel"] in channels
+                    or channel.get("status") not in {"pending", "inflight", "delivered", "not_sent", "unknown", "skipped", "abandoned"}):
+                raise ValueError()
+            channels.add(channel["channel"])
+            for field in ("attempted_at", "confirmed_at", "resolved_at"):
+                if field in channel and not timestamp(channel[field]):
+                    raise ValueError()
+            status = channel["status"]
+            if status in {"pending", "skipped"}:
+                if set(channel) != {"channel", "status"}:
+                    raise ValueError()
+            elif "attempted_at" not in channel:
+                raise ValueError()
+            if (status == "delivered") != ("confirmed_at" in channel):
+                raise ValueError()
+            if ("resolution" in channel) != ("resolved_at" in channel):
+                raise ValueError()
+            if "resolution" in channel:
+                if {"delivered": "delivered", "not-delivered": "not_sent", "abandon": "abandoned"}.get(channel["resolution"]) != status:
+                    raise ValueError()
+            elif status == "abandoned":
+                raise ValueError()
+        for alert in entry["alerts"]:
+            if not isinstance(alert, dict) or "_cooldown_key" not in alert or any(k not in {"_cooldown_key", "_strategy_active_key"} or not isinstance(v, str) or not v.strip() or len(v) > 512 for k, v in alert.items()):
+                raise ValueError()
+        if entry["state"] == "complete" and any(c["status"] in {"pending", "inflight", "unknown"} for c in entry["channels"]):
+            raise ValueError()
+    if active > 1:
+        raise ValueError()
+
+
+def _read_monitor_delivery_unlocked():
+    path = _monitor_delivery_path()
+    marker_exists = os.path.lexists(path + ".initialized")
+    if marker_exists:
+        _delivery_validate_marker()
+    try:
+        fd = _delivery_private_file(path, os.O_RDONLY)
+    except FileNotFoundError:
+        if marker_exists:
+            raise MonitorDeliveryBlocked("delivery_history_missing")
+        return {"version": 1, "transactions": []}
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            if not marker_exists:
+                raise MonitorDeliveryBlocked("delivery_marker_missing")
+            data = json.load(handle, object_pairs_hook=_delivery_json_object, parse_constant=_delivery_json_constant)
+        _validate_monitor_delivery_data(data)
+        return data
+    except MonitorDeliveryBlocked:
+        raise
+    except Exception:
+        raise MonitorDeliveryBlocked("delivery_history_invalid")
+
+
+def _write_monitor_delivery_unlocked(data):
+    _validate_monitor_delivery_data(data)
+    path = _monitor_delivery_path()
+    marker = path + ".initialized"
+    if not os.path.lexists(marker):
+        fd = _delivery_private_file(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, b"1\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _delivery_sync_dir()
+    else:
+        _delivery_validate_marker()
+    if os.path.lexists(path):
+        fd = _delivery_private_file(path, os.O_RDONLY)
+        os.close(fd)
+    temporary = path + ".tmp." + uuid.uuid4().hex
+    try:
+        fd = _delivery_private_file(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _delivery_sync_dir()
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+def _delivery_entry_summary(entry):
+    return {"id": entry["id"], "state": entry["state"], "created_at": entry["created_at"],
+            "channels": [{k: v for k, v in item.items() if k in {"channel", "status", "resolution", "resolved_at"}} for item in entry["channels"]],
+            "alert_count": len(entry["alerts"])}
+
+
+def monitor_delivery_status():
+    try:
+        with _monitor_delivery_lock():
+            data = _read_monitor_delivery_unlocked()
+            active = next((e for e in data["transactions"] if e["state"] == "active"), None)
+            return {"ok": True, "blocked": active is not None, "delivery_policy": "any_channel_success",
+                    "active": _delivery_entry_summary(active) if active else None,
+                    "history_count": len(data["transactions"]),
+                    "message": "存在待恢复或待人工确认的投递。" if active else "没有未确认投递。",
+                    "recovery_actions": {"delivered": "已在接收端确认送达；仅提交冷却，不再发送。",
+                                         "not-delivered": "确认未送达；若所有通道均未送达，允许后续新鲜行情重新评估，不重放旧消息。",
+                                         "abandon": "放弃本次候选并提交冷却，不再发送。"}}
+    except MonitorDeliveryBlocked as exc:
+        return _delivery_blocked(exc.code)
+    except Exception:
+        return _delivery_blocked()
+
+
+def _finish_monitor_delivery_unlocked(data, entry):
+    unknown = [c for c in entry["channels"] if c["status"] in {"inflight", "unknown"}]
+    if unknown:
+        return dict(_delivery_blocked("delivery_confirmation_required"), delivery_id=entry["id"],
+                    channels=_delivery_entry_summary(entry)["channels"])
+    if any(c["status"] == "pending" for c in entry["channels"]):
+        return _delivery_blocked("delivery_attempt_incomplete")
+    confirmed = [c for c in entry["channels"] if c["status"] in {"delivered", "abandoned"}]
+    committed = False
+    if confirmed:
+        stamp = max(c.get("confirmed_at", c.get("resolved_at", entry["created_at"])) for c in confirmed)
+        if not _commit_alert_cooldowns(entry["alerts"], sent_at=stamp):
+            return dict(_delivery_blocked("delivery_cooldown_pending"), delivery_id=entry["id"])
+        committed = True
+    entry["state"] = "complete"
+    entry["completed_at"] = time.time()
+    _write_monitor_delivery_unlocked(data)
+    return {"ok": True, "blocked": False, "delivery_id": entry["id"], "cooldown_committed": committed}
+
+
+def _recover_monitor_delivery_unlocked(data):
+    entry = next((e for e in data["transactions"] if e["state"] == "active"), None)
+    if entry is None:
+        return {"ok": True, "blocked": False}
+    changed = False
+    for channel in entry["channels"]:
+        if channel["status"] == "inflight":
+            channel["status"] = "unknown"
+            changed = True
+        elif channel["status"] == "pending":
+            # No transport call was permitted before inflight was durably written.
+            channel["status"] = "skipped"
+            changed = True
+    if changed:
+        _write_monitor_delivery_unlocked(data)
+    return _finish_monitor_delivery_unlocked(data, entry)
+
+
+def monitor_delivery_recover():
+    try:
+        load_monitor_state()  # Refuse recovery through damaged cooldown state.
+        with _monitor_delivery_lock():
+            return _recover_monitor_delivery_unlocked(_read_monitor_delivery_unlocked())
+    except MonitorDeliveryBlocked as exc:
+        return _delivery_blocked(exc.code)
+    except Exception:
+        return _delivery_blocked()
+
+
+def monitor_delivery_resolve(delivery_id, channel, action):
+    if (not re.fullmatch(r"[0-9a-f]{32}", str(delivery_id)) or channel not in {"telegram", "weixin", "qq"}
+            or action not in {"delivered", "not-delivered", "abandon"}):
+        return {"ok": False, "error": "delivery_resolution_invalid", "message": "用法：monitor delivery resolve ID CHANNEL delivered|not-delivered|abandon"}
+    try:
+        load_monitor_state()
+        with _monitor_delivery_lock():
+            data = _read_monitor_delivery_unlocked()
+            entry = next((e for e in data["transactions"] if e["id"] == delivery_id and e["state"] == "active"), None)
+            item = next((c for c in entry["channels"] if c["channel"] == channel), None) if entry else None
+            if item is None or item["status"] not in {"unknown", "inflight"}:
+                return {"ok": False, "error": "delivery_resolution_not_pending"}
+            # Invalid/stale requests must never recover or alter another transaction.
+            _recover_monitor_delivery_unlocked(data)
+            item["resolution"] = action
+            item["resolved_at"] = time.time()
+            item["status"] = {"delivered": "delivered", "not-delivered": "not_sent", "abandon": "abandoned"}[action]
+            if action == "delivered":
+                item["confirmed_at"] = item["resolved_at"]
+            _write_monitor_delivery_unlocked(data)
+            result = _finish_monitor_delivery_unlocked(data, entry)
+            result["message_sent"] = False
+            return result
+    except MonitorDeliveryBlocked as exc:
+        return _delivery_blocked(exc.code)
+    except Exception:
+        return _delivery_blocked()
+
+
+def _delivery_transport_status(result):
+    # Transport code must supply a positive acknowledgement, not just exit=0.
+    if isinstance(result, dict) and result.get("delivery_status") == "delivered" and result.get("ok") is True:
+        return "delivered"
+    if isinstance(result, dict) and result.get("delivery_status") == "not_sent" and result.get("ok") is False:
+        return "not_sent"
+    return "unknown"
+
+
+def _send_monitor_notification_channel(channel, text):
+    return send_openclaw_message(channel, text)
+
+
+def _monitor_delivery_minimal_alerts(alerts):
+    if alerts is None:
+        return []
+    if not isinstance(alerts, list):
+        raise MonitorDeliveryBlocked("delivery_alerts_invalid")
+    result = []
+    for alert in alerts:
+        if not isinstance(alert, dict) or "_cooldown_key" not in alert:
+            raise MonitorDeliveryBlocked("delivery_alerts_invalid")
+        minimal = {key: alert[key] for key in ("_cooldown_key", "_strategy_active_key") if key in alert}
+        if any(not isinstance(value, str) or not value.strip() or len(value) > 512 for value in minimal.values()):
+            raise MonitorDeliveryBlocked("delivery_alerts_invalid")
+        result.append(minimal)
+    return result
+
+
+
+
+
+
+def _monitor_health_lines(status):
+    lines = []
+    state = status.get("state_health") or {}
+    if state.get("blocked"):
+        lines.append("- 盯盘已暂停：" + state.get("message", "状态不可用，请保留原文件并检查。"))
+        lines.append("- 状态原因：" + str(state.get("code", "state_unavailable")))
+    delivery = status.get("delivery") or {}
+    if delivery.get("blocked"):
+        lines.append("- 自动通知已暂停：" + delivery.get("message", "存在尚未完成的投递记录，需要核实。"))
+        active = delivery.get("active") or {}
+        if active:
+            lines.append("- 待核实投递：" + active["id"])
+            for item in active.get("channels", []):
+                lines.append("- " + item["channel"] + "：" + item["status"])
+        lines.append("- 查看详情：monitor delivery status；确认收件端结果后再执行 resolve。")
+    return lines
+
+
+def monitor_delivery_command(args):
+    if not args or args == ["status"]:
+        return monitor_delivery_status()
+    if args == ["recover"]:
+        return monitor_delivery_recover()
+    if len(args) == 4 and args[0] == "resolve":
+        return monitor_delivery_resolve(args[1], args[2], args[3])
+    return {"ok": False, "error": "delivery_command_invalid", "message_sent": False,
+            "message": "用法：monitor delivery status | recover | resolve ID CHANNEL delivered|not-delivered|abandon"}
+
 
 
 def _default_monitor_state():
@@ -3701,33 +4829,51 @@ def _locked_file(path, exclusive=True, blocking=True):
             lock_file.close()
 
 
-def _read_monitor_state_unlocked():
-    if not os.path.exists(MONITOR_STATE_PATH):
-        return _default_monitor_state()
-    try:
-        with open(MONITOR_STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return _default_monitor_state()
-    if not isinstance(data, dict):
-        return _default_monitor_state()
-    data.setdefault("last_alerts", {})
-    data.setdefault("last_quotes", {})
-    data.setdefault("strategy_active", {})
-    data.setdefault("last_checked_symbols", [])
-    data.setdefault("last_alert_candidates", [])
-    data.setdefault("last_suppressed", [])
-    return data
+def _read_monitor_state_unlocked(history_expected=False):
+    return _monitor_state_snapshot(history_expected=history_expected)[0]
+
 
 
 def _write_monitor_state_unlocked(state):
-    state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    tmp = f"{MONITOR_STATE_PATH}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, MONITOR_STATE_PATH)
+    incoming = _validate_monitor_state(state)
+    current_state, expected = _monitor_state_snapshot()
+    if incoming['revision'] != current_state['revision']:
+        raise MonitorStateBlocked('state_revision_conflict')
+    incoming['revision'] = current_state['revision'] + 1
+    incoming['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    serialized = json.dumps(incoming, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
+    if len(serialized) > _MONITOR_STATE_MAX_BYTES:
+        raise MonitorStateBlocked('state_too_large')
+    _monitor_state_ensure_marker()
+    directory = os.path.dirname(os.path.abspath(MONITOR_STATE_PATH))
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix='.monitor-state-', suffix='.tmp', dir=directory)
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        current = _monitor_state_lstat(MONITOR_STATE_PATH)
+        if ((expected is None) != (current is None) or
+                (expected is not None and _monitor_state_identity(expected) != _monitor_state_identity(current))):
+            raise MonitorStateBlocked('state_changed_before_write')
+        if not _monitor_state_marker_present():
+            raise MonitorStateBlocked('state_marker_invalid')
+        os.replace(temporary, MONITOR_STATE_PATH)
+        temporary = None
+        _MONITOR_STATE_OBSERVED_PATHS.add(os.path.abspath(MONITOR_STATE_PATH))
+        _monitor_state_fsync_directory()
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        raise MonitorStateBlocked('state_write_failed') from None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
 
 
 def _merge_alert_timestamps(current, incoming):
@@ -3758,35 +4904,29 @@ def _merge_last_quotes(current, incoming):
     return merged
 
 
-def load_monitor_state():
-    try:
-        with _locked_file(MONITOR_STATE_LOCK_PATH, exclusive=False):
-            return _read_monitor_state_unlocked()
-    except Exception:
-        return _default_monitor_state()
+def load_monitor_state(history_expected=False):
+    with _locked_monitor_state():
+        return _read_monitor_state_unlocked(history_expected=history_expected)
+
 
 
 def save_monitor_state(state):
     try:
-        with _locked_file(MONITOR_STATE_LOCK_PATH, exclusive=True):
+        incoming = _validate_monitor_state(state)
+        with _locked_monitor_state():
             current = _read_monitor_state_unlocked()
+            if incoming['revision'] != current['revision']:
+                raise MonitorStateBlocked('state_revision_conflict')
             merged = dict(current)
-            merged.update({
-                k: v for k, v in state.items()
-                if k not in {"last_alerts", "last_quotes", "updated_at"}
-            })
-            merged["last_alerts"] = _merge_alert_timestamps(
-                current.get("last_alerts", {}),
-                state.get("last_alerts", {})
-            )
-            merged["last_quotes"] = _merge_last_quotes(
-                current.get("last_quotes", {}),
-                state.get("last_quotes", {})
-            )
+            merged.update({key: value for key, value in incoming.items()
+                           if key not in {'last_alerts', 'last_quotes', 'updated_at'}})
+            merged['last_alerts'] = _merge_alert_timestamps(current.get('last_alerts', {}), incoming.get('last_alerts', {}))
+            merged['last_quotes'] = _merge_last_quotes(current.get('last_quotes', {}), incoming.get('last_quotes', {}))
             _write_monitor_state_unlocked(merged)
-            return True
+        return True
     except Exception:
         return False
+
 
 
 def _monitor_to_float(x, default=None):
@@ -3797,7 +4937,8 @@ def _monitor_to_float(x, default=None):
             x = x.replace("%", "").replace(",", "").strip()
             if x in {"", "-", "None", "nan"}:
                 return default
-        return float(x)
+        value = float(x)
+        return value if math.isfinite(value) else default
     except Exception:
         return default
 
@@ -3830,7 +4971,7 @@ def _eastmoney_quote_supplement(code):
     url = "https://push2.eastmoney.com/api/qt/stock/get"
     params = {
         "secid": get_secid(code),
-        "fields": "f8,f10",
+        "fields": "f8,f10,f86",
         "fltt": "2",
         "invt": "2"
     }
@@ -3842,6 +4983,7 @@ def _eastmoney_quote_supplement(code):
         "turnover_rate_percent": _monitor_to_float(data.get("f8")),
         "volume_ratio": _monitor_to_float(data.get("f10")),
         "source": "东方财富实时行情",
+        "data_time": (datetime.fromtimestamp(float(data["f86"]), timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S") if _monitor_to_float(data.get("f86")) else None),
         "fetched_at": fetched_at
     }
     result["turnover_rate"] = result["turnover_rate_percent"]
@@ -4079,33 +5221,82 @@ def _eastmoney_minute_bars(code):
     return bars
 
 
+# Only completed daily history is cached. Today's bar always comes from a fresh quote.
+_STRATEGY_DAILY_CACHE = {}
+_STRATEGY_DAILY_CACHE_SECONDS = 300
+
+
+def _market_now():
+    return datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+
+
+def _market_data_error(value, now=None, max_age_seconds=120):
+    if not value:
+        return "行情未提供数据时间，无法确认实时性"
+    try:
+        stamp = datetime.fromisoformat(str(value).strip())
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return "行情数据时间格式无效"
+    age = ((now or _market_now()) - stamp).total_seconds()
+    if age < -30:
+        return "行情数据时间晚于当前时间"
+    if age > max_age_seconds:
+        return f"行情已过期（约 {int(age)} 秒）"
+    return None
+
+
 def _strategy_daily_bars(code, current_snapshot):
     from backtest.data_provider import load_bars
 
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=45)
-    data = load_bars(
-        code,
-        "1d",
-        start_date.strftime("%Y-%m-%d"),
-        end_date.strftime("%Y-%m-%d"),
-    )
+    end_date = _market_now()
     today = end_date.strftime("%Y-%m-%d")
-    bars = [
-        dict(item)
-        for item in data.get("bars", [])
-        if str(item.get("time", ""))[:10] < today
-    ]
-    current_volume = current_snapshot.get("volume")
-    current_price = current_snapshot.get("price")
-    if current_volume is not None:
+    cache_key = (str(code), today)
+    cached = _STRATEGY_DAILY_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached["fetched_at"] < _STRATEGY_DAILY_CACHE_SECONDS:
+        history = cached["bars"]
+    else:
+        start_date = end_date - timedelta(days=120)
+        data = load_bars(code, "1d", start_date.strftime("%Y-%m-%d"), today, timeout_seconds=3)
+        if data.get("cache_stale"):
+            raise RuntimeError("日线缓存已过期，暂不用于实时策略")
+        # New providers expose normalized shares. Old deployments need explicit
+        # source-based conversion rather than mixing Sina shares and Eastmoney lots.
+        volume_unit = data.get("volume_unit")
+        source = data.get("original_source") if data.get("used_cache") else data.get("source")
+        if volume_unit in {"share", "shares", "股"}:
+            volume_factor = 1
+        elif volume_unit in {"lot", "lots", "手"} or (not volume_unit and source in {"东方财富", "akshare兜底"}):
+            volume_factor = 100
+        elif not volume_unit and source == "新浪日K兜底":
+            volume_factor = 1
+        else:
+            raise RuntimeError("日线成交量单位未知，暂不用于实时策略")
+        history = []
+        for item in data.get("bars", []):
+            if str(item.get("time", ""))[:10] >= today:
+                continue
+            bar = dict(item)
+            volume = _monitor_to_float(bar.get("volume"))
+            if volume is None or volume < 0:
+                raise RuntimeError("日线成交量缺失或无效")
+            bar["volume"] = volume * volume_factor
+            history.append(bar)
+        if not history:
+            raise RuntimeError("日线历史为空")
+        if len(_STRATEGY_DAILY_CACHE) > 512:
+            _STRATEGY_DAILY_CACHE.clear()
+        _STRATEGY_DAILY_CACHE[cache_key] = {"bars": history, "fetched_at": time.monotonic()}
+    bars = [dict(item) for item in history]
+    if current_snapshot.get("volume") is not None and current_snapshot.get("price") is not None:
         bars.append({
             "time": today,
-            "open": current_price,
-            "close": current_price,
-            "high": current_price,
-            "low": current_price,
-            "volume": current_volume,
+            "open": current_snapshot.get("open", current_snapshot["price"]),
+            "close": current_snapshot["price"],
+            "high": current_snapshot.get("high", current_snapshot["price"]),
+            "low": current_snapshot.get("low", current_snapshot["price"]),
+            "volume": current_snapshot["volume"],
             "amount": current_snapshot.get("amount"),
         })
     return bars
@@ -4114,22 +5305,46 @@ def _strategy_daily_bars(code, current_snapshot):
 def _aggregate_minute_bars(bars, minutes):
     if minutes == 1:
         return list(bars)
-    output = []
-    bucket = []
+    if minutes <= 0:
+        raise ValueError("分钟周期必须为正整数")
+    buckets = {}
+    # Quote trend timestamps label completed minutes. 09:30 / 13:00 are
+    # session-opening points, not a completed continuous-auction minute.
     for bar in bars:
-        bucket.append(bar)
-        if len(bucket) < minutes:
+        try:
+            stamp = datetime.fromisoformat(str(bar.get("time", "")))
+        except ValueError:
+            continue
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(timezone(timedelta(hours=8))).replace(tzinfo=None)
+        minute = stamp.hour * 60 + stamp.minute
+        if stamp.second or stamp.microsecond:
+            continue
+        if 9 * 60 + 30 < minute <= 11 * 60 + 30:
+            session_start = stamp.replace(hour=9, minute=30)
+        elif 13 * 60 < minute <= 15 * 60:
+            session_start = stamp.replace(hour=13, minute=0)
+        else:
+            continue
+        offset = int((stamp - session_start).total_seconds() // 60)
+        bucket_number = (offset - 1) // minutes
+        key = (session_start, bucket_number)
+        buckets.setdefault(key, []).append((stamp, bar))
+    output = []
+    for (session_start, bucket_number), items in sorted(buckets.items()):
+        expected = [session_start + timedelta(minutes=bucket_number * minutes + index + 1) for index in range(minutes)]
+        # Missing, duplicate, out-of-order and partial periods stay unavailable.
+        if [stamp for stamp, _ in items] != expected:
+            continue
+        bucket = [bar for _, bar in items]
+        if any(_monitor_to_float(bar.get(field)) is None for bar in bucket for field in ("open", "close", "high", "low", "volume", "amount")):
             continue
         output.append({
-            "time": bucket[-1]["time"],
-            "open": bucket[0]["open"],
-            "close": bucket[-1]["close"],
-            "high": max(x["high"] for x in bucket if x["high"] is not None),
-            "low": min(x["low"] for x in bucket if x["low"] is not None),
-            "volume": sum(x["volume"] or 0 for x in bucket),
-            "amount": sum(x["amount"] or 0 for x in bucket)
+            "time": expected[-1].strftime("%Y-%m-%d %H:%M:%S"),
+            "open": bucket[0]["open"], "close": bucket[-1]["close"],
+            "high": max(bar["high"] for bar in bucket), "low": min(bar["low"] for bar in bucket),
+            "volume": sum(bar["volume"] for bar in bucket), "amount": sum(bar["amount"] for bar in bucket),
         })
-        bucket = []
     return output
 
 
@@ -4163,7 +5378,7 @@ def _indicator_values(bars):
         changes = [closes[i] - closes[i - 1] for i in range(index - period + 1, index + 1)]
         gains = sum(max(x, 0) for x in changes) / period
         losses = sum(max(-x, 0) for x in changes) / period
-        rsi_values.append(100.0 if losses == 0 else 100 - 100 / (1 + gains / losses))
+        rsi_values.append((50.0 if gains == 0 else 100.0) if losses == 0 else 100 - 100 / (1 + gains / losses))
 
     k_values = []
     d_values = []
@@ -4195,79 +5410,133 @@ def _indicator_values(bars):
         ma[str(period_value)] = values
 
     return {
-        "dif": dif,
-        "dea": dea,
-        "macd": macd,
+        "dif": [value if index >= 33 else None for index, value in enumerate(dif)],
+        "dea": [value if index >= 33 else None for index, value in enumerate(dea)],
+        "macd": [value if index >= 33 else None for index, value in enumerate(macd)],
         "rsi": rsi_values,
-        "kdj_k": k_values,
-        "kdj_d": d_values,
+        "kdj_k": [value if index >= 8 else None for index, value in enumerate(k_values)],
+        "kdj_d": [value if index >= 8 else None for index, value in enumerate(d_values)],
         "ma": ma
     }
 
 
-def build_strategy_snapshot(code):
-    errors = []
-    quote_row = _monitor_quote(code)
-    if quote_row.get("error"):
-        errors.append(f"新浪实时行情暂不可用：{quote_row.get('error')}")
+def _strategy_condition_source(condition):
+    kind = condition.get("type")
+    if kind in {"macd_cross", "kdj_cross", "volume_vs_average", "indicator_threshold", "price_vs_ma"}:
+        return "daily" if int(condition.get("timeframe_minutes", 1)) == 1440 else "minute"
+    if kind == "quote_threshold" and condition.get("field") in {"volume_ratio", "turnover_rate", "turnover_rate_percent"}:
+        return "supplement"
+    return "quote"
 
-    supplement = {}
-    try:
-        supplement = _eastmoney_quote_supplement(code)
-    except Exception as exc:
-        errors.append(f"东方财富量比/换手率暂不可用：{exc}")
 
-    bars_1m = []
-    try:
-        bars_1m = _eastmoney_minute_bars(code)
-    except Exception as exc:
-        errors.append(f"东方财富分钟行情暂不可用：{exc}")
+def _strategy_required_sources(conditions=None):
+    if conditions is None:
+        return {"quote", "supplement", "minute", "daily"}
+    return {"quote"} | {_strategy_condition_source(item) for item in conditions}
+
+
+def _fetch_strategy_inputs(requirements):
+    """One bounded pool per scan; independent symbols/sources cannot queue serially."""
+    inputs = {code: {} for code in requirements}
+    def fetch(code, source):
+        started = time.monotonic()
+        try:
+            if source == "quote":
+                value = _monitor_quote(code)
+            elif source == "supplement":
+                value = _eastmoney_quote_supplement(code)
+            elif source == "minute":
+                value = _eastmoney_minute_bars(code)
+            else:
+                value = _strategy_daily_bars(code, {})
+            return {"value": value, "elapsed_ms": round((time.monotonic() - started) * 1000, 2)}
+        except Exception as exc:
+            return {"error": str(exc), "elapsed_ms": round((time.monotonic() - started) * 1000, 2)}
+    jobs = [(code, source) for code, sources in requirements.items() for source in sorted(sources)]
+    if not jobs:
+        return inputs
+    with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
+        futures = {executor.submit(fetch, code, source): (code, source) for code, source in jobs}
+        for future in as_completed(futures):
+            code, source = futures[future]
+            inputs[code][source] = future.result()
+    return inputs
+
+
+def build_strategy_snapshot(code, conditions=None, _inputs=None):
+    sources = _strategy_required_sources(conditions)
+    inputs = _inputs if _inputs is not None else _fetch_strategy_inputs({code: sources})[code]
+    source_names = {"quote": "新浪实时行情", "supplement": "量比/换手率行情", "minute": "分钟行情", "daily": "日线历史"}
+    source_errors = {source: f"{source_names[source]}：{entry['error']}" for source, entry in inputs.items() if entry.get("error")}
+    quote_row = inputs.get("quote", {}).get("value") or {}
+    data_time = quote_row.get("数据时间") or quote_row.get("时间")
+    quote_error = quote_row.get("error") or _market_data_error(data_time)
+    if _monitor_row_price(quote_row) is None or (_monitor_row_price(quote_row) or 0) <= 0:
+        quote_error = quote_error or "实时价格缺失或无效"
+    if quote_error:
+        source_errors["quote"] = str(quote_error)
+        quote_row = {}
+
+    supplement = inputs.get("supplement", {}).get("value") or {}
+    if "supplement" in sources:
+        error = _market_data_error(supplement.get("data_time"))
+        if error:
+            source_errors.setdefault("supplement", error)
+            supplement = {}
+
+    bars_1m = inputs.get("minute", {}).get("value") or []
+    if "minute" in sources:
+        error = _market_data_error(bars_1m[-1].get("time") if bars_1m else None)
+        previous_time = ""
+        for bar in bars_1m:
+            stamp = str(bar.get("time", ""))
+            if stamp <= previous_time or any(_monitor_to_float(bar.get(field)) is None for field in ("open", "high", "low", "close", "volume", "amount")):
+                error = "分钟行情缺字段或时间顺序无效"
+                break
+            previous_time = stamp
+        if error:
+            source_errors.setdefault("minute", error)
+            bars_1m = []
 
     current_snapshot = {
         "price": _monitor_row_price(quote_row),
         "volume": _monitor_to_float(quote_row.get("成交量")),
         "amount": _monitor_to_float(quote_row.get("成交额")),
     }
-    bars_daily = []
-    try:
-        bars_daily = _strategy_daily_bars(code, current_snapshot)
-    except Exception as exc:
-        errors.append(f"日线成交量历史暂不可用：{exc}")
+    bars_daily = [dict(item) for item in inputs.get("daily", {}).get("value", [])]
+    if "daily" in sources:
+        if "quote" in source_errors:
+            source_errors["daily"] = "当日实时行情不可用，不能拼接日线策略数据"
+            bars_daily = []
+        elif not source_errors.get("daily") and current_snapshot["volume"] is not None:
+            bars_daily.append({
+                "time": _market_now().strftime("%Y-%m-%d"),
+                "open": _monitor_to_float(quote_row.get("今开"), current_snapshot["price"]),
+                "close": current_snapshot["price"],
+                "high": _monitor_to_float(quote_row.get("最高"), current_snapshot["price"]),
+                "low": _monitor_to_float(quote_row.get("最低"), current_snapshot["price"]),
+                "volume": current_snapshot["volume"], "amount": current_snapshot["amount"],
+            })
+        elif not source_errors.get("daily"):
+            source_errors["daily"] = "当日成交量缺失，不能拼接日线策略数据"
+            bars_daily = []
 
-    bars = {
-        1: bars_1m,
-        3: _aggregate_minute_bars(bars_1m, 3),
-        5: _aggregate_minute_bars(bars_1m, 5),
-        1440: bars_daily,
-    }
-    indicators = {minutes: _indicator_values(rows) for minutes, rows in bars.items()}
-    turnover_rate_percent = supplement.get("turnover_rate_percent")
-    amplitude_percent = _monitor_to_float(quote_row.get("振幅%"))
+    bars = {1: bars_1m, 3: _aggregate_minute_bars(bars_1m, 3), 5: _aggregate_minute_bars(bars_1m, 5), 1440: bars_daily}
     return {
-        "code": code,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "data_time": quote_row.get("数据时间") or quote_row.get("时间"),
-        "price": current_snapshot["price"],
+        "code": code, "time": _market_now().strftime("%Y-%m-%d %H:%M:%S"), "data_time": data_time,
+        **current_snapshot,
         "change_percent": _monitor_row_pct(quote_row),
-        "volume": current_snapshot["volume"],
-        "amount": current_snapshot["amount"],
         "volume_ratio": supplement.get("volume_ratio"),
-        "turnover_rate_percent": turnover_rate_percent,
-        "turnover_rate": turnover_rate_percent,
-        "amplitude_percent": amplitude_percent,
-        "bids": quote_row.get("买一到买五"),
-        "asks": quote_row.get("卖一到卖五"),
+        "turnover_rate_percent": supplement.get("turnover_rate_percent"),
+        "turnover_rate": supplement.get("turnover_rate_percent"),
+        "amplitude_percent": _monitor_to_float(quote_row.get("振幅%")),
+        "bids": quote_row.get("买一到买五"), "asks": quote_row.get("卖一到卖五"),
         "order_imbalance": _monitor_to_float(quote_row.get("盘口委比%")),
         "buy_sell_ratio": _monitor_to_float(quote_row.get("买卖盘强弱比")),
-        "field_sources": {
-            "amplitude_percent": "新浪实时行情/本地计算",
-            "volume_ratio": "东方财富实时行情",
-            "turnover_rate_percent": "东方财富实时行情"
-        },
-        "bars": bars,
-        "indicators": indicators,
-        "errors": errors,
-        "sources": ["sina", "eastmoney"]
+        "field_sources": {"amplitude_percent": "新浪实时行情/本地计算", "volume_ratio": "东方财富实时行情", "turnover_rate_percent": "东方财富实时行情"},
+        "bars": bars, "indicators": {minutes: _indicator_values(rows) for minutes, rows in bars.items()},
+        "source_errors": source_errors, "errors": list(source_errors.values()),
+        "sources": sorted(sources), "timings_ms": {source: entry.get("elapsed_ms") for source, entry in inputs.items()},
     }
 
 
@@ -4294,6 +5563,9 @@ def _last_two(values):
 
 def evaluate_strategy_condition(condition, snapshot):
     condition_type = condition.get("type")
+    source_error = snapshot.get("source_errors", {}).get(_strategy_condition_source(condition))
+    if source_error:
+        return None, source_error
     timeframe = int(condition.get("timeframe_minutes", 1))
     bars = snapshot.get("bars", {}).get(timeframe, [])
     indicators = snapshot.get("indicators", {}).get(timeframe, {})
@@ -4342,8 +5614,8 @@ def evaluate_strategy_condition(condition, snapshot):
         minimum = float(condition.get("min_ratio", 1.2))
         if condition.get("direction") == "sell":
             sell_ratio = 1 / ratio
-            return sell_ratio >= minimum, f"卖盘/买盘={sell_ratio:.2f}倍，要求{minimum:.2f}倍"
-        return ratio >= minimum, f"买盘/卖盘={ratio:.2f}倍，要求{minimum:.2f}倍"
+            return _compare(sell_ratio, condition.get("operator", ">="), minimum), f"卖盘/买盘={sell_ratio:.2f}倍，要求{minimum:.2f}倍"
+        return _compare(ratio, condition.get("operator", ">="), minimum), f"买盘/卖盘={ratio:.2f}倍，要求{minimum:.2f}倍"
 
     if condition_type == "indicator_threshold":
         values = indicators.get(condition.get("indicator"), [])
@@ -4435,7 +5707,10 @@ def strategy_check():
     strategy = cfg.get("strategy_monitor", {}) or {}
     process = monitor_pid_status()
     trading = trading_time_status()
-    runtime_state = load_monitor_state()
+    try:
+        runtime_state = load_monitor_state()
+    except MonitorStateBlocked as exc:
+        return {**exc.as_status(), "status": "FAIL", "probe_executed": False}
     selfcheck_state = _strategy_selfcheck_state()
     holding_pool = list(cfg.get("holding_pool", []) or [])
     watch_pool = list(cfg.get("watch_pool", []) or [])
@@ -4536,6 +5811,7 @@ def strategy_check():
             else "策略配置、行情连接与策略引擎自检可用。"
         ),
     }
+
 
 
 def _parse_strategy_mock_text(mock_text):
@@ -4641,7 +5917,7 @@ def strategy_simulate(symbol, preset="breakout", mock_text="", send_test=False):
     )
     send_result = None
     if send_test:
-        send_result = send_telegram_message(reminder)
+        send_result = send_monitor_notification(reminder)
 
     state = _strategy_selfcheck_state()
     simulated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4675,6 +5951,7 @@ def strategy_simulate(symbol, preset="breakout", mock_text="", send_test=False):
             "仅运行本地模拟判断；未读取真实行情、未启动盯盘。"
         ),
     }
+
 
 
 def _gateway_probe_for_strategy_test():
@@ -4735,7 +6012,12 @@ def strategy_test(rule_id, symbol=None, live_probe=True):
 
 
 def build_strategy_alerts_once():
-    cfg = load_watchlist_config()
+    try:
+        cfg = load_watchlist_config()
+    except Exception:
+        return {"ok": False, "blocked": True, "alerts": [], "alerts_count": 0,
+                "checked_count": 0, "error": "notification_config_unavailable",
+                "message": "盯盘配置不可用，已停止扫描及发送；请检查配置。"}
     monitor = cfg.get("monitor", {}) or {}
     strategy = cfg.get("strategy_monitor", {}) or {}
     holdings = cfg.get("holding_pool", []) or []
@@ -4747,7 +6029,6 @@ def build_strategy_alerts_once():
         return {"ok": True, "monitor_enabled": False, "mode": monitor.get("mode"), "alerts": [], "alerts_count": 0}
     t_status = trading_time_status()
     if monitor.get("market_hours_only", True) and not t_status.get("is_trading_time"):
-        next_open = t_status.get("next_open")
         return {
             "ok": True,
             "monitor_enabled": True,
@@ -4759,11 +6040,7 @@ def build_strategy_alerts_once():
             "message": (
                 f"{t_status.get('message', '当前不在A股交易时间。')}"
                 "策略盯盘当前不扫描行情、不触发提醒；"
-                + (
-                    f"按工作日规则将在 {next_open} 后恢复扫描。"
-                    if next_open else
-                    "将在下一个交易时段恢复扫描。"
-                )
+                + _monitor_resume_message(t_status)
             )
         }
     if not rules:
@@ -4776,98 +6053,106 @@ def build_strategy_alerts_once():
             "message": "策略盯盘已启动，但当前没有策略。请先设置策略盯盘。"
         }
 
-    state = load_monitor_state()
+    started = time.monotonic()
+    try:
+        state = load_monitor_state()
+    except MonitorStateBlocked as exc:
+        return {**exc.as_status(), "alerts": [], "alerts_count": 0, "checked_count": 0}
     active = state.setdefault("strategy_active", {})
-    alerts = []
-    checked = []
-    snapshot_cache = {}
-    runtime_unavailable = []
-
+    alerts, checked, suppressed, runtime_unavailable = [], [], [], []
+    _, profile = _get_monitor_profile(cfg)
+    cooldown_minutes = float(profile.get("cooldown_minutes", 1))
+    rule_targets = []
+    conditions_by_code = {}
+    pools = []
+    if "holding_pool" in strategy_targets:
+        pools.extend(("holding_pool", item) for item in holdings)
+    if "watch_pool" in strategy_targets:
+        pools.extend(("watch_pool", item) for item in watch_items)
     for rule in rules:
         targets = []
-        pools = []
-        if "holding_pool" in strategy_targets:
-            pools.extend(("holding_pool", item) for item in holdings)
-        if "watch_pool" in strategy_targets:
-            pools.extend(("watch_pool", item) for item in watch_items)
         seen_codes = set()
         for pool_key, item in pools:
             code = str(item.get("code") if isinstance(item, dict) else item).strip()
-            if (
-                code
-                and code not in seen_codes
-                and (not rule.get("code") or rule.get("code") == code)
-            ):
+            if code and code not in seen_codes and (not rule.get("code") or rule.get("code") == code):
                 seen_codes.add(code)
-                targets.append((
-                    code,
-                    item.get("name", code) if isinstance(item, dict) else code,
-                    pool_key,
-                ))
+                targets.append((code, item.get("name", code) if isinstance(item, dict) else code, pool_key))
+        # Explicit symbols do not silently depend on membership in a watch/holding pool.
+        if rule.get("code") and str(rule["code"]) not in seen_codes:
+            code = str(rule["code"])
+            targets.append((code, code, "explicit_symbols"))
+        rule_targets.append((rule, targets))
+        for code, _, _ in targets:
+            conditions_by_code.setdefault(code, []).extend(rule.get("conditions", []))
 
+    inputs = _fetch_strategy_inputs({code: _strategy_required_sources(conditions) for code, conditions in conditions_by_code.items()})
+    snapshot_cache = {code: build_strategy_snapshot(code, conditions, _inputs=inputs[code]) for code, conditions in conditions_by_code.items()}
+    scan_day = _market_now().strftime("%Y%m%d")
+    for rule, targets in rule_targets:
         for code, name, pool_key in targets:
-            if code not in snapshot_cache:
-                snapshot_cache[code] = build_strategy_snapshot(code)
             snapshot = snapshot_cache[code]
-            matched_result, evaluations = evaluate_strategy_rule(rule, snapshot)
+            try:
+                matched_result, evaluations = evaluate_strategy_rule(rule, snapshot)
+            except (TypeError, ValueError, KeyError) as exc:
+                matched_result, evaluations = None, [{"matched": None, "reason": f"策略配置或行情无效：{exc}"}]
             matched = matched_result is True
-            available = matched_result is not None
             for evaluation in evaluations:
                 if evaluation.get("matched") is None:
                     runtime_unavailable.append(f"{code}: {evaluation.get('reason')}")
-
-            active_key = f"{rule.get('id')}:{code}"
+            active_key = f"{scan_day}:{rule.get('id')}:{code}"
             was_active = bool(active.get(active_key))
-            active[active_key] = bool(matched)
+            # Unknown data is not a false condition; preserve a delivered activation.
+            # True is committed only after a successful notification, so failure retries.
+            if matched_result is False:
+                active[active_key] = False
             checked.append({
-                "code": code,
-                "name": name,
-                "rule_id": rule.get("id"),
-                "matched": matched,
-                "available": available,
-                "amplitude_percent": snapshot.get("amplitude_percent"),
-                "volume_ratio": snapshot.get("volume_ratio"),
-                "turnover_rate_percent": snapshot.get("turnover_rate_percent"),
-                "data_time": snapshot.get("data_time"),
-                "field_sources": snapshot.get("field_sources", {}),
-                "evaluations": evaluations,
-                "data_errors": snapshot.get("errors", [])
+                "code": code, "name": name, "rule_id": rule.get("id"), "matched": matched,
+                "available": matched_result is not None,
+                "amplitude_percent": snapshot.get("amplitude_percent"), "volume_ratio": snapshot.get("volume_ratio"),
+                "turnover_rate_percent": snapshot.get("turnover_rate_percent"), "data_time": snapshot.get("data_time"),
+                "field_sources": snapshot.get("field_sources", {}), "evaluations": evaluations,
+                "data_errors": snapshot.get("errors", []), "timings_ms": snapshot.get("timings_ms", {}),
             })
             if matched and not was_active:
+                reason = _cooldown_suppressed_reason(state, code, f"strategy:{rule.get('id')}", cooldown_minutes)
+                if reason:
+                    suppressed.append({"code": code, "rule_id": rule.get("id"), "suppressed_reason": reason})
+                    continue
+                side = rule.get("side", "alert")
+                label = {"buy": "买入", "sell": "卖出"}.get(side, "条件")
                 alerts.append({
                     "_cooldown_key": _alert_key(code, f"strategy:{rule.get('id')}"),
-                    "level": "important",
-                    "mode": "strategy",
-                    "profile_name": "策略盯盘",
-                    "pool": _monitor_target_name(pool_key),
-                    "code": code,
-                    "name": name,
-                    "side": rule.get("side", "buy"),
-                    "rule": rule.get("raw_text"),
-                    "message": f"{name}({code}) 满足{'买入' if rule.get('side') == 'buy' else '卖出'}策略。",
-                    "reasons": [x["reason"] for x in evaluations if x.get("matched") is True]
+                    "_strategy_active_key": active_key,
+                    "level": "important", "mode": "strategy", "profile_name": "策略盯盘",
+                    "pool": "指定标的" if pool_key == "explicit_symbols" else _monitor_target_name(pool_key),
+                    "code": code, "name": name, "side": side, "rule": rule.get("raw_text"),
+                    "message": f"{name}({code}) 满足{label}策略。",
+                    "reasons": [x["reason"] for x in evaluations if x.get("matched") is True],
                 })
-
     state["strategy_last_unavailable"] = sorted(set(runtime_unavailable))
-    save_monitor_state(state)
+    state["last_scan_at"] = _market_now().strftime("%Y-%m-%d %H:%M:%S")
+    state["last_quote_at"] = max((item["data_time"] for item in checked if item.get("data_time")), default=None)
+    state["last_checked_symbols"] = [{"code": item["code"], "name": item["name"]} for item in checked]
+    state["last_suppressed"] = suppressed[-50:]
+    state["last_alert_candidates"] = alerts[-50:]
+    saved = save_monitor_state(state)
+    committed_revision = state.get("revision", 0) + 1 if saved else None
     return {
-        "ok": True,
-        "monitor_enabled": True,
-        "mode": "strategy",
-        "profile_name": "策略盯盘",
-        "interval_seconds": 1,
-        "targets": list(strategy_targets),
-        "checked_count": len(checked),
-        "checked": checked,
-        "alerts_count": len(alerts),
-        "alerts": alerts,
+        "state_revision": committed_revision,
+        "ok": saved, "monitor_enabled": True, "mode": "strategy", "profile_name": "策略盯盘",
+        "interval_seconds": profile.get("interval_seconds", 1), "cooldown_minutes": cooldown_minutes,
+        "targets": list(strategy_targets), "checked_count": len(checked), "checked": checked,
+        "alerts_count": len(alerts), "alerts": alerts, "suppressed": suppressed,
         "unavailable_conditions": strategy.get("unavailable_conditions", []),
-        "runtime_unavailable": state.get("strategy_last_unavailable", [])
+        "runtime_unavailable": state["strategy_last_unavailable"],
+        "last_scan_at": state["last_scan_at"], "last_quote_at": state["last_quote_at"],
+        "scan_duration_ms": round((time.monotonic() - started) * 1000, 2),
     }
 
 
+
 def _alert_key(code, rule):
-    today = datetime.now().strftime("%Y%m%d")
+    today = _market_now().strftime("%Y%m%d")
     return f"{today}:{code}:{rule}"
 
 
@@ -4950,25 +6235,28 @@ def _append_normal_alert(alerts, suppressed, state, alert, cooldown_minutes):
 
 
 def _commit_alert_cooldowns(alerts, sent_at=None):
-    keys = {
-        alert.get("_cooldown_key")
-        for alert in (alerts or [])
-        if isinstance(alert, dict) and alert.get("_cooldown_key")
-    }
-    if not keys:
-        return True
-
+    keys = {alert.get('_cooldown_key') for alert in (alerts or [])
+            if isinstance(alert, dict) and alert.get('_cooldown_key')}
     try:
-        with _locked_file(MONITOR_STATE_LOCK_PATH, exclusive=True):
+        timestamp = sent_at if sent_at is not None else time.time()
+        if not _monitor_state_finite_number(timestamp):
+            raise MonitorStateBlocked('state_schema_invalid')
+        with _locked_monitor_state():
             state = _read_monitor_state_unlocked()
-            last_alerts = state.setdefault("last_alerts", {})
-            timestamp = float(sent_at if sent_at is not None else time.time())
+            if not keys:
+                return True
+            last_alerts = state.setdefault('last_alerts', {})
             for key in keys:
-                last_alerts[key] = timestamp
+                last_alerts[key] = max(float(last_alerts.get(key, 0)), float(timestamp))
+            active = state.setdefault('strategy_active', {})
+            for alert in alerts or []:
+                if isinstance(alert, dict) and alert.get('_strategy_active_key'):
+                    active[alert['_strategy_active_key']] = True
             _write_monitor_state_unlocked(state)
         return True
     except Exception:
         return False
+
 
 
 def _get_monitor_profile(cfg):
@@ -4993,61 +6281,103 @@ def _get_monitor_profile(cfg):
 
 
 
+# Published full-year SSE/SZSE schedules; this does not infer future calendars
+# from weekdays or government make-up workdays, or cover unscheduled closures.
+_A_SHARE_CALENDARS = {
+    2026: {
+        "holidays": (
+            ("2026-01-01", "2026-01-03", "元旦"),
+            ("2026-02-15", "2026-02-23", "春节"),
+            ("2026-04-04", "2026-04-06", "清明节"),
+            ("2026-05-01", "2026-05-05", "劳动节"),
+            ("2026-06-19", "2026-06-21", "端午节"),
+            ("2026-09-25", "2026-09-27", "中秋节"),
+            ("2026-10-01", "2026-10-07", "国庆节"),
+        ),
+        "sources": (
+            "https://www.sse.com.cn/disclosure/announcement/general/c/c_20251222_10802507.shtml",
+            "https://www.szse.cn/disclosure/notice/t20251222_618087.html",
+        ),
+    },
+}
+
+
+def _market_calendar_now(now=None):
+    now = now if now is not None else _market_now()
+    if now.tzinfo is not None:
+        now = now.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    return now
+
+
+def _a_share_calendar_day(now):
+    calendar = _A_SHARE_CALENDARS.get(now.year)
+    if calendar is None:
+        return {"verified": False, "is_trading_day": None, "holiday": None}
+    date_text = now.date().isoformat()
+    holiday = next((name for start, end, name in calendar["holidays"] if start <= date_text <= end), None)
+    return {
+        "verified": True,
+        "is_trading_day": now.weekday() < 5 and holiday is None,
+        "holiday": holiday,
+    }
+
+
 def _next_weekday_open(now):
-    morning_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    afternoon_open = now.replace(hour=13, minute=0, second=0, microsecond=0)
-    if now.weekday() < 5:
-        if now < morning_open:
-            return morning_open
-        if now < afternoon_open and now.hour * 60 + now.minute > 11 * 60 + 30:
-            return afternoon_open
-    candidate = morning_open
-    candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
+    """Next session start in a verified calendar; historical function name kept."""
+    now = _market_calendar_now(now)
+    candidate = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    while candidate.year in _A_SHARE_CALENDARS:
+        if _a_share_calendar_day(candidate)["is_trading_day"]:
+            for hour, minute in ((9, 30), (13, 0)):
+                opening = candidate.replace(hour=hour, minute=minute)
+                if opening > now:
+                    return opening
         candidate += timedelta(days=1)
-    return candidate
+    return None
 
 
 def is_a_share_trading_time(now=None):
-    """
-    A股连续竞价交易时间判断：
-    周一至周五 09:30-11:30、13:00-15:00。
-    暂不判断法定节假日。
-    """
-    now = now or datetime.now()
-
-    if now.weekday() >= 5:
+    """Verified A-share monitoring hours, including the closing auction."""
+    now = _market_calendar_now(now)
+    if not _a_share_calendar_day(now)["is_trading_day"]:
         return False
-
-    hm = now.hour * 60 + now.minute
-    morning_start = 9 * 60 + 30
-    morning_end = 11 * 60 + 30
-    afternoon_start = 13 * 60
-    afternoon_end = 15 * 60
-
-    return (morning_start <= hm <= morning_end) or (afternoon_start <= hm <= afternoon_end)
+    clock = now.time()
+    return (datetime_time(9, 30) <= clock <= datetime_time(11, 30)) or (
+        datetime_time(13) <= clock <= datetime_time(15)
+    )
 
 
 def trading_time_status(now=None):
-    now = now or datetime.now()
+    now = _market_calendar_now(now)
     weekday_names = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
     weekday_name = weekday_names[now.weekday()]
-    hm = now.hour * 60 + now.minute
-    is_trading_day = now.weekday() < 5
+    clock = now.time()
+    calendar_day = _a_share_calendar_day(now)
+    is_trading_day = calendar_day["is_trading_day"]
     is_trading_time = is_a_share_trading_time(now)
 
-    if not is_trading_day:
+    if not calendar_day["verified"]:
+        session = "calendar_unverified"
+        message = f"尚未收录{now.year}年交易所休市日历，无法确认交易日；默认暂停时段内盯盘，请更新日历。"
+    elif not is_trading_day:
         session = "non_trading_day"
-        message = f"今天是{weekday_name}，属于非交易日。"
-    elif hm < 9 * 60 + 30:
+        message = (
+            f"今天是{calendar_day['holiday']}公告休市日。"
+            if calendar_day["holiday"] else
+            f"今天是{weekday_name}，属于周末休市日。"
+        )
+    elif clock < datetime_time(9, 30):
         session = "pre_open"
-        message = "今天是交易日，当前尚未开盘。"
-    elif 11 * 60 + 30 < hm < 13 * 60:
+        message = "今天按已收录日历为交易日，当前尚未到09:30盯盘开始时间。"
+    elif datetime_time(11, 30) < clock < datetime_time(13):
         session = "lunch_break"
         message = "今天是交易日，当前处于午间休市。"
-    elif hm > 15 * 60:
+    elif clock > datetime_time(15):
         session = "after_close"
         message = "今天是交易日，当前已经收盘。"
+    elif clock >= datetime_time(14, 57):
+        session = "closing_auction"
+        message = "当前处于A股收盘集合竞价时段，盯盘继续运行。"
     else:
         session = "trading"
         message = "当前处于A股连续竞价交易时段。"
@@ -5058,11 +6388,24 @@ def trading_time_status(now=None):
         "weekday": weekday_name,
         "is_trading_day": is_trading_day,
         "is_trading_time": is_trading_time,
+        "is_continuous_auction": is_trading_time and session == "trading",
         "session": session,
         "message": message,
         "next_open": next_open.strftime("%Y-%m-%d %H:%M:%S") if next_open else None,
-        "rule": "A股交易时间：周一至周五 09:30-11:30、13:00-15:00；暂不判断法定节假日。"
+        "calendar_verified": calendar_day["verified"],
+        "calendar_status": "verified" if calendar_day["verified"] else "unverified_year",
+        "calendar_years": sorted(_A_SHARE_CALENDARS),
+        "calendar_sources": list(_A_SHARE_CALENDARS.get(now.year, {}).get("sources", ())),
+        "timezone": "Asia/Shanghai",
+        "rule": "A股盯盘：已收录日历的交易日09:30:00–11:30:00、13:00:00–15:00:00（含截止时点）；14:57起为收盘集合竞价。未收录年份暂停时段内盯盘；临时停市和个股停牌须另行核实。",
     }
+
+
+def _monitor_resume_message(trading_status):
+    next_open = trading_status.get("next_open")
+    if next_open:
+        return f"按已收录交易所日历预计在 {next_open} 恢复扫描；临时停市须另行核实。"
+    return "尚无法确认下一个开盘时间，需更新交易所日历后再核实。"
 
 
 def _monitor_start_message(label, start_result, verify_result, trading_status):
@@ -5075,15 +6418,9 @@ def _monitor_start_message(label, start_result, verify_result, trading_status):
         return prefix + "当前处于交易时段，将按已保存策略扫描并触发提醒。"
 
     detail = trading_status.get("message", "当前不在A股交易时间。")
-    next_open = trading_status.get("next_open")
-    resume = (
-        f"按工作日规则将在 {next_open} 后恢复扫描"
-        if next_open else
-        "将在下一个交易时段恢复扫描"
-    )
     return (
         f"{prefix}{detail}当前不会扫描行情或触发提醒，后台进程保持等待；"
-        f"{resume}。法定节假日暂未纳入日历判断。"
+        + _monitor_resume_message(trading_status)
     )
 
 
@@ -5092,7 +6429,12 @@ def build_monitor_alerts_once():
     单次盯盘检查。
     第一版只按涨跌幅阈值判断，不调用大模型。
     """
-    cfg = load_watchlist_config()
+    try:
+        cfg = load_watchlist_config()
+    except Exception:
+        return {"ok": False, "blocked": True, "alerts": [], "alerts_count": 0,
+                "checked_count": 0, "error": "notification_config_unavailable",
+                "message": "盯盘配置不可用，已停止扫描及发送；请检查配置。"}
     monitor = cfg.get("monitor", {}) or {}
     enabled = bool(monitor.get("enabled", False))
 
@@ -5114,7 +6456,6 @@ def build_monitor_alerts_once():
         }
 
     if market_hours_only and not t_status.get("is_trading_time"):
-        next_open = t_status.get("next_open")
         return {
             "ok": True,
             "monitor_enabled": True,
@@ -5128,15 +6469,14 @@ def build_monitor_alerts_once():
             "message": (
                 f"{t_status.get('message', '当前不在A股交易时间。')}"
                 "已跳过实时盯盘提醒，不会根据收盘或非实时行情触发 alerts；"
-                + (
-                    f"按工作日规则将在 {next_open} 后恢复扫描。"
-                    if next_open else
-                    "将在下一个交易时段恢复扫描。"
-                )
+                + _monitor_resume_message(t_status)
             )
         }
 
-    state = load_monitor_state()
+    try:
+        state = load_monitor_state()
+    except MonitorStateBlocked as exc:
+        return {**exc.as_status(), "alerts": [], "alerts_count": 0, "checked_count": 0}
 
     watch_items = cfg.get("watch_pool", []) or []
     holding_items = cfg.get("holding_pool", []) or []
@@ -5150,6 +6490,12 @@ def build_monitor_alerts_once():
     candidates = []
     suppressed = []
     last_quote_at = None
+    codes = set()
+    for pool_name, items in (("holding_pool", holding_items), ("watch_pool", watch_items)):
+        if pool_name in targets:
+            codes.update(str(item.get("code") if isinstance(item, dict) else item).strip() for item in items)
+    quote_inputs = _fetch_strategy_inputs({code: {"quote", "supplement"} for code in codes if code})
+    checked_codes = set()
 
     def check_item(item, pool_name):
         nonlocal last_quote_at
@@ -5158,9 +6504,19 @@ def build_monitor_alerts_once():
         if not code:
             return
 
+        if code in checked_codes:
+            return
+        checked_codes.add(code)
         name = item.get("name", code) if isinstance(item, dict) else code
-        row = _monitor_quote(code)
-        display_row = _quote_with_realtime_metrics(code, row) if not row.get("error") else row
+        row = quote_inputs[code].get("quote", {}).get("value") or {"error": quote_inputs[code].get("quote", {}).get("error", "行情缺失")}
+        supplement = quote_inputs[code].get("supplement", {}).get("value") or {}
+        supplement_error = _market_data_error(supplement.get("data_time"))
+        display_row = dict(row)
+        display_row.update({
+            "amplitude_percent": _monitor_to_float(row.get("振幅%")),
+            "volume_ratio": None if supplement_error else supplement.get("volume_ratio"),
+            "turnover_rate_percent": None if supplement_error else supplement.get("turnover_rate_percent"),
+        })
 
         pct = _monitor_row_pct(row)
         price = _monitor_row_price(row)
@@ -5185,13 +6541,16 @@ def build_monitor_alerts_once():
             "error": row.get("error")
         })
 
-        if row.get("error") or pct is None:
+        quote_error = row.get("error") or _market_data_error(data_time)
+        if price is None or price <= 0:
+            quote_error = quote_error or "实时价格缺失或无效"
+        if quote_error or pct is None:
             suppressed.append({
                 "code": code,
                 "name": name,
                 "pool": _monitor_target_name(pool_name),
                 "rule": "行情检查",
-                "suppressed_reason": row.get("error") or "行情数据缺失",
+                "suppressed_reason": quote_error or "行情数据缺失",
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
             return
@@ -5303,17 +6662,19 @@ def build_monitor_alerts_once():
 
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state["last_scan_at"] = now_text
-    state["last_quote_at"] = last_quote_at or now_text
+    state["last_quote_at"] = last_quote_at
     state["last_checked_symbols"] = [
         {"code": item.get("code"), "name": item.get("name"), "pool": item.get("pool")}
         for item in checked
     ]
     state["last_alert_candidates"] = candidates[-50:]
     state["last_suppressed"] = suppressed[-50:]
-    save_monitor_state(state)
+    saved = save_monitor_state(state)
+    committed_revision = state.get("revision", 0) + 1 if saved else None
 
     return {
-        "ok": True,
+        "state_revision": committed_revision,
+        "ok": saved,
         "monitor_enabled": True,
         "mode": mode,
         "profile_name": profile.get("name", mode),
@@ -5323,7 +6684,7 @@ def build_monitor_alerts_once():
         "checked_count": len(checked),
         "checked": checked,
         "last_scan_at": now_text,
-        "last_quote_at": last_quote_at or now_text,
+        "last_quote_at": last_quote_at,
         "alert_candidates_count": len(candidates),
         "alert_candidates": candidates,
         "suppressed_count": len(suppressed),
@@ -5335,12 +6696,30 @@ def build_monitor_alerts_once():
 
 
 
+
 def _safe_error_summary(error):
-    text = str(error or "")
-    text = re.sub(r"bot[0-9A-Za-z:_-]+", "bot***", text)
-    text = re.sub(r"Bearer\s+[0-9A-Za-z._-]+", "Bearer ***", text, flags=re.I)
-    text = re.sub(r"token[=:]\s*[^\\s,]+", "token=***", text, flags=re.I)
-    return text[:240] if text else ""
+    # Provider errors can contain arbitrary credentials. Return authored
+    # categories only, rather than attempting to redact individual tokens.
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "通知发送超时；请稍后检查通道状态。"
+    try:
+        text = str(error or "").lower()
+    except Exception:
+        text = ""
+    categories = (
+        (("401", "403", "unauthorized", "forbidden", "authentication", "invalid api key"),
+         "通知通道认证或权限检查未通过；请检查本机通道配置。"),
+        (("429", "rate limit", "too many requests"), "通知通道触发限流；请稍后重试。"),
+        (("timeout", "timed out", "超时"), "通知发送超时；请稍后检查通道状态。"),
+        (("connection refused", "connection reset", "network unreachable", "enotfound", "econnrefused"),
+         "通知通道连接失败；请检查服务和网络状态。"),
+    )
+    for needles, summary in categories:
+        if any(needle in text for needle in needles):
+            return summary
+    if isinstance(error, OSError):
+        return "通知通道或本机执行失败；请检查通道配置、服务和本机状态。"
+    return "通知发送失败；请检查通道配置和服务状态。"
 
 
 def _notification_targets():
@@ -5354,64 +6733,32 @@ def _notification_targets():
 
 
 def send_openclaw_message(channel, text):
-    """Delegate delivery to an already configured OpenClaw channel extension."""
-    normalized = _normalize_channel_name(channel)
-    delivery = _notification_targets().get(normalized)
-    if isinstance(delivery, str):
-        delivery = {"target": delivery}
-    if not isinstance(delivery, dict) or not str(delivery.get("target") or "").strip():
-        return {
-            "ok": False,
-            "skipped": True,
-            "channel": normalized,
-            "error": "未配置通知目标；为防止误发，本次已跳过。",
-        }
-
-    provider_channel = {
-        "weixin": "openclaw-weixin",
-        "telegram": "telegram",
-        "qq": "qqbot",
-    }.get(normalized, normalized)
-    cmd = [
-        "openclaw", "message", "send",
-        "--channel", provider_channel,
-        "--target", str(delivery["target"]),
-        "--message", str(text),
-        "--json",
-    ]
-    if delivery.get("account"):
-        cmd[3:3] = ["--account", str(delivery["account"])]
+    """Delegate to the explicitly selected channel and require a send receipt."""
     try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=25,
-        )
-        raw = (proc.stdout or "").strip()
-        payload = {}
-        if raw:
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                payload = {"raw": raw[:500]}
-        if proc.returncode != 0:
-            return {
-                "ok": False,
-                "channel": normalized,
-                "error": _safe_error_summary(proc.stderr or proc.stdout),
-                "returncode": proc.returncode,
-            }
-        return {
-            "ok": True,
-            "channel": normalized,
-            "provider_channel": provider_channel,
-            "target_masked": str(delivery["target"])[:4] + "***",
-            "response": payload,
-        }
+        normalized = _validated_notify_channel(channel)
+    except ValueError:
+        return {"ok": False, "skipped": True, "delivery_status": "not_sent",
+                "attempted": False, "error_code": "notification_channel_invalid",
+                "error": "通知通道无效；本次未发送。"}
+    try:
+        delivery = _notification_targets().get(normalized)
+        if isinstance(delivery, str):
+            delivery = {"target": delivery}
+        if not isinstance(delivery, dict) or not str(delivery.get("target") or "").strip():
+            return {"ok": False, "skipped": True, "channel": normalized,
+                    "delivery_status": "not_sent", "attempted": False,
+                    "error": "未配置通知目标；为防止误发，本次已跳过。"}
+        provider_channel = {"weixin": "openclaw-weixin", "telegram": "telegram",
+                            "qq": "qqbot"}[normalized]
+        cmd = ["openclaw", "message", "send", "--channel", provider_channel,
+               "--target", str(delivery["target"]), "--message", str(text), "--json"]
+        if delivery.get("account"):
+            cmd[3:3] = ["--account", str(delivery["account"])]
     except Exception as exc:
-        return {"ok": False, "channel": normalized, "error": _safe_error_summary(exc)}
+        return {"ok": False, "channel": normalized, "delivery_status": "not_sent",
+                "attempted": False, "error": _safe_error_summary(exc)}
+    return _run_openclaw_notification(cmd, normalized, provider_channel)
+
 
 
 def send_telegram_message(text):
@@ -5422,34 +6769,77 @@ def send_weixin_message(text):
     return send_openclaw_message("weixin", text)
 
 
-def send_monitor_notification(text, channels=None, source_channel=None):
-    channels = _normalize_notify_channels(
-        {"notify_channels": channels or []},
-        include_fallback=not bool(channels),
-    )
-    results = []
-    for channel in channels:
-        result = send_openclaw_message(channel, text)
-        results.append(result)
-
-    ok = any(item.get("ok") for item in results)
-    payload = {
-        "ok": ok,
-        "source_channel": _normalize_channel_name(source_channel),
-        "notify_channels": channels,
-        "results": results,
-        "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+def send_monitor_notification(text, channels=None, source_channel=None, alerts=None, expected_state_revision=None):
+    scope = _notification_channel_scope(channels)
+    if not scope.get("ok"):
+        return scope
+    channels = scope["notify_channels"]
     try:
+        minimal_alerts = _monitor_delivery_minimal_alerts(alerts)
         state = load_monitor_state()
-        state["last_notify_result"] = payload
-        save_monitor_state(state)
-        cfg = load_watchlist_config()
-        cfg.setdefault("monitor", {})["last_notify_result"] = payload
-        save_watchlist_config(cfg)
+        # Establish the cooldown state before the independent journal marker.
+        if not os.path.lexists(MONITOR_STATE_PATH) and not save_monitor_state(state):
+            return _delivery_blocked("monitor_state_unavailable")
+        with _monitor_delivery_lock():
+            data = _read_monitor_delivery_unlocked()
+            recovered = _recover_monitor_delivery_unlocked(data)
+            if not recovered.get("ok"):
+                return recovered
+            # The caller's candidate could predate a recovered ACK. Require a fresh scan.
+            if recovered.get("cooldown_committed"):
+                return {"ok": False, "blocked": False, "skipped": True, "error": "delivery_recovered_rescan_required", "cooldown_committed": True}
+            # A concurrent completed delivery or scan can invalidate the caller's
+            # candidate while it waits for this lock. Never send a stale snapshot.
+            state = load_monitor_state()
+            if minimal_alerts and (type(expected_state_revision) is not int or expected_state_revision < 0
+                                   or state.get("revision", 0) != expected_state_revision):
+                return {"ok": False, "blocked": False, "skipped": True, "error": "delivery_candidate_stale",
+                        "message": "提醒候选对应的状态已变化，本轮未发送；等待下一次新鲜扫描。"}
+            entry = {"id": uuid.uuid4().hex, "state": "active", "created_at": time.time(), "alerts": minimal_alerts,
+                     "channels": [{"channel": c, "status": "pending"} for c in channels]}
+            data["transactions"].append(entry)
+            _write_monitor_delivery_unlocked(data)
+            results = []
+            for item in entry["channels"]:
+                item.update(status="inflight", attempted_at=time.time())
+                _write_monitor_delivery_unlocked(data)
+                try:
+                    result = _send_monitor_notification_channel(item["channel"], text)
+                except Exception:
+                    result = {"ok": False, "channel": item["channel"], "delivery_status": "unknown", "error": "通知结果未知。"}
+                outcome = _delivery_transport_status(result)
+                item["status"] = outcome
+                if outcome == "delivered":
+                    item["confirmed_at"] = time.time()
+                _write_monitor_delivery_unlocked(data)
+                results.append({"channel": item["channel"], "ok": outcome == "delivered", "delivery_status": outcome})
+                if outcome == "unknown":
+                    for remaining in entry["channels"]:
+                        if remaining["status"] == "pending":
+                            remaining["status"] = "skipped"
+                    _write_monitor_delivery_unlocked(data)
+                    break
+            finished = _finish_monitor_delivery_unlocked(data, entry)
+            delivered = [c["channel"] for c in entry["channels"] if c["status"] == "delivered"]
+            failed = [c["channel"] for c in entry["channels"] if c["status"] != "delivered"]
+            payload = {"ok": bool(delivered) and finished.get("ok", False), "partial": bool(delivered) and bool(failed),
+                       "successful_channels": delivered, "failed_channels": failed, "delivery_policy": "any_channel_success",
+                       "source_channel": _normalize_channel_name(source_channel), "notify_channels": channels, "results": results,
+                       "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "delivery_id": entry["id"],
+                       "blocked": finished.get("blocked", False), "cooldown_committed": finished.get("cooldown_committed", False)}
+            if finished.get("error"):
+                payload["error"] = finished["error"]
+                payload["message"] = finished["message"]
+            # Diagnostic persistence is separate from the durable acknowledgement.
+            state = load_monitor_state()
+            state["last_notify_result"] = payload
+            save_monitor_state(state)
+            return payload
+    except MonitorDeliveryBlocked as exc:
+        return _delivery_blocked(exc.code)
     except Exception:
-        pass
-    return payload
+        return _delivery_blocked()
+
 
 
 def format_monitor_alerts_for_telegram(result):
@@ -5486,17 +6876,23 @@ def format_monitor_alerts_for_telegram(result):
     return "\n".join(lines).strip()
 
 
-def _monitor_channel_arg(args, default="weixin"):
+def _monitor_channel_arg(args, default=None):
     channel = default
+    specified = False
     index = 0
     while index < len(args):
         value = args[index]
-        if value in {"--channel", "-c"} and index + 1 < len(args):
-            channel = args[index + 1]
+        if value in {"--channel", "-c"}:
+            if specified or index + 1 >= len(args):
+                raise ValueError("notification_channel_argument_invalid")
+            channel = _validated_notify_channel(args[index + 1])
+            specified = True
             index += 2
-        else:
+        elif value == "--json":
             index += 1
-    return _normalize_channel_name(channel)
+        else:
+            raise ValueError("notification_channel_argument_invalid")
+    return _validated_notify_channel(channel) if channel is not None else None
 
 
 def _format_monitor_diagnose(result):
@@ -5508,8 +6904,21 @@ def _format_monitor_diagnose(result):
     checked = scan.get("checked") or result.get("last_checked") or []
     candidates = scan.get("alert_candidates") or result.get("last_alert_candidates") or []
     suppressed = scan.get("suppressed") or result.get("last_suppressed") or []
-    notify_channels = _normalize_notify_channels(monitor)
+    try:
+        notify_channels = _normalize_notify_channels(monitor, include_fallback=False)
+    except ValueError:
+        notify_channels = []
     channel_display = {"weixin": "微信", "telegram": "Telegram", "qq": "QQ"}
+    delivery = result.get("last_notify_result") or {}
+    channel_results = delivery.get("results") or []
+    succeeded = [channel_display.get(item.get("channel"), item.get("channel")) for item in channel_results if item.get("ok")]
+    failed = [channel_display.get(item.get("channel"), item.get("channel")) for item in channel_results if not item.get("ok")]
+    delivery_summary = "暂无记录"
+    if succeeded and failed:
+        delivery_summary = f"部分成功：{', '.join(succeeded)} 已送达；{', '.join(failed)} 失败。当前按至少一个通道成功确认提醒，不单独补发失败通道。"
+    elif channel_results:
+        delivery_summary = "全部通道成功" if not failed else "全部通道失败"
+
 
     lines = [
         "普通盯盘诊断：",
@@ -5519,12 +6928,14 @@ def _format_monitor_diagnose(result):
         f"- 后台进程：{'运行中' if process.get('running') else '未运行'}",
         f"- PID：{process.get('pid') if process.get('running') else '无'}",
         f"- 当前是否交易时间：{'是' if trading.get('is_trading_time') else '否'}",
+        f"- 交易日历状态：{trading.get('message') or '未知'}",
         f"- last_scan_at：{result.get('last_scan_at') or '-'}",
         f"- last_quote_at：{result.get('last_quote_at') or '-'}",
         "",
         "二、通知出口",
         f"- source_channel：{channel_display.get(_normalize_channel_name(monitor.get('source_channel')), monitor.get('source_channel') or '-')}",
         f"- notify_channels：{', '.join(channel_display.get(x, x) for x in notify_channels)}",
+        f"- 通知结果：{delivery_summary}",
         f"- last_notify_result：{json.dumps(result.get('last_notify_result'), ensure_ascii=False)[:600] if result.get('last_notify_result') else '暂无记录'}",
         "",
         "三、最近扫描标的",
@@ -5566,65 +6977,82 @@ def _format_monitor_diagnose(result):
         lines.append("- 有候选提醒且未被 cooldown 压制；若未收到，请看 last_notify_result。")
 
     lines.extend(["", "六、结论", f"- {result.get('conclusion') or '-'}"])
+    warnings = _monitor_health_lines(status)
+    if warnings:
+        lines[1:1] = ["", *warnings, ""]
     return "\n".join(lines)
+
 
 
 def monitor_diagnose(raw_json=False):
     status = _monitor_status_with_runtime()
-    state = load_monitor_state()
+    state, scan_result = {}, None
     monitor = status.get("monitor", {}) or {}
-    scan_result = None
-    if monitor.get("enabled") and monitor.get("mode") == "normal":
-        scan_result = build_monitor_alerts_once()
-        state = load_monitor_state()
-
+    if not status.get("blocked"):
+        try:
+            state = load_monitor_state()
+            if (monitor.get("enabled") and monitor.get("mode") == "normal"
+                    and status.get("trading_time", {}).get("is_trading_time")):
+                scan_result = build_monitor_alerts_once()
+                state = load_monitor_state()
+        except MonitorStateBlocked as exc:
+            status.update(ok=False, blocked=True, state_health=exc.as_status())
     conclusion = "普通盯盘未开启。"
-    if monitor.get("enabled"):
-        if not (status.get("trading_time") or {}).get("is_trading_time"):
-            conclusion = "当前不在交易时间，后台若运行也只等待，不扫描实时行情。"
+    if status.get("blocked"):
+        conclusion = "状态或投递记录待核实，已暂停自动扫描和发送。请保留原文件，先查看上方原因。"
+    elif monitor.get("enabled"):
+        trading = status.get("trading_time") or {}
+        if not trading.get("is_trading_time"):
+            if monitor.get("mode") == "normal":
+                scan_result = {"ok": True, "checked_count": 0, "alerts_count": 0,
+                               "alerts": [], "skipped": True, "trading_time": trading}
+            conclusion = ((trading.get("message") or "当前不在已确认的交易时间。")
+                          + "后台若运行也只等待，不扫描实时行情。" + _monitor_resume_message(trading))
+        elif scan_result and scan_result.get("ok") is False:
+            conclusion = "扫描状态未能保存；本轮不会发送，请检查状态存储或并发冲突。"
         elif scan_result and scan_result.get("alerts_count"):
             conclusion = "本次诊断发现候选提醒，真实后台会按 notify_channels 推送。"
         elif scan_result:
             conclusion = "本次诊断完成扫描，但未满足提醒阈值或被 cooldown 压制。"
-
-    result = {
-        "ok": True,
-        "status": status,
-        "scan_result": scan_result,
-        "last_scan_at": state.get("last_scan_at"),
-        "last_quote_at": state.get("last_quote_at"),
-        "last_checked": state.get("last_checked_symbols", []),
-        "last_quotes": state.get("last_quotes", {}),
-        "last_alert_candidates": state.get("last_alert_candidates", []),
-        "last_suppressed": state.get("last_suppressed", []),
-        "last_notify_result": state.get("last_notify_result"),
-        "conclusion": conclusion,
-    }
+    result = {"ok": not status.get("blocked") and (scan_result or {}).get("ok", True),
+              "blocked": bool(status.get("blocked")), "status": status, "scan_result": scan_result,
+              "last_scan_at": state.get("last_scan_at"), "last_quote_at": state.get("last_quote_at"),
+              "last_checked": state.get("last_checked_symbols", []), "last_quotes": state.get("last_quotes", {}),
+              "last_alert_candidates": state.get("last_alert_candidates", []),
+              "last_suppressed": state.get("last_suppressed", []),
+              "last_notify_result": state.get("last_notify_result"), "conclusion": conclusion}
     if raw_json:
         return result
     return {"_output_format": "text", "text": _format_monitor_diagnose(result)}
 
 
-def monitor_notify_test(channel="weixin"):
-    channel = _normalize_channel_name(channel)
+
+def monitor_notify_test(channel=None):
+    try:
+        channel = _validated_notify_channel(channel) if channel is not None else None
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
     text = (
         "【龙虾盯盘测试】\n"
-        "这是一条微信通知链路测试。\n"
+        "这是一条通知链路测试。\n"
         "来源：monitor notify-test\n"
-        f"通道：{channel}\n"
+        f"通道：{channel or '现有通知配置'}\n"
         f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         "说明：模拟/测试消息，不是真实交易信号。"
     )
     result = send_monitor_notification(
         text,
-        channels=[channel],
+        channels=[channel] if channel is not None else None,
         source_channel=channel,
     )
     return {"ok": bool(result.get("ok")), "test": True, "notify_result": result}
 
 
-def monitor_simulate_alert(channel="weixin"):
-    channel = _normalize_channel_name(channel)
+def monitor_simulate_alert(channel=None):
+    try:
+        channel = _validated_notify_channel(channel) if channel is not None else None
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
     result = {
         "mode": "normal",
         "profile_name": "普通盯盘",
@@ -5641,7 +7069,7 @@ def monitor_simulate_alert(channel="weixin"):
     text += format_monitor_alerts_for_telegram(result)
     notify_result = send_monitor_notification(
         text,
-        channels=[channel],
+        channels=[channel] if channel is not None else None,
         source_channel=channel,
     )
     return {
@@ -5658,115 +7086,104 @@ def monitor_once():
     return result
 
 
+def _monitor_wait(seconds, mode=None):
+    """Reload toggles during sleep rather than sleeping through five minutes."""
+    deadline = time.monotonic() + max(0, seconds)
+    while time.monotonic() < deadline:
+        monitor = load_watchlist_config().get("monitor", {}) or {}
+        if not monitor.get("enabled") or (mode and monitor.get("mode") != mode):
+            return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+
+
 def monitor_loop():
-    """
-    循环盯盘。
-    当前终端会被占用；停止方式：
-    - 另一个窗口执行：python3 a_stock_query.py nl "关闭盯盘"
-    - 或当前窗口 Ctrl+C
-    """
     lock_file = _acquire_monitor_instance_lock()
     if lock_file is None:
-        print_json({
-            "ok": False,
-            "message": "已有 monitor_loop 实例持有运行锁，本进程退出。",
-            "lock_file": MONITOR_LOCK_PATH
-        })
+        print_json({"ok": False, "message": "已有 monitor_loop 实例持有运行锁，本进程退出。", "lock_file": MONITOR_LOCK_PATH})
         return
-
     own_pid = os.getpid()
     last_idle_log = 0.0
+    notify_failures = 0
+    retry_notification_at = 0.0
     try:
         _write_monitor_pid(own_pid)
-        print_json({
-            "ok": True,
-            "message": "monitor_loop 已启动。若 monitor.enabled=false 会自动退出。",
-            "pid": own_pid,
-            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-
+        print_json({"ok": True, "message": "monitor_loop 已启动；关闭配置后会自动退出。", "pid": own_pid})
         while True:
-            cfg = load_watchlist_config()
-            monitor = cfg.get("monitor", {}) or {}
-            mode, profile = _get_monitor_profile(cfg)
-
-            if not bool(monitor.get("enabled", False)):
-                print_json({
-                    "ok": True,
-                    "message": "实时盯盘已关闭，monitor_loop 退出。",
-                    "stopped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                })
-                return
-
-            market_hours_only = bool(monitor.get("market_hours_only", True))
-            t_status = trading_time_status()
-            if market_hours_only and not t_status.get("is_trading_time"):
-                next_open = t_status.get("next_open")
-                print_json({
-                    "ok": True,
-                    "message": (
-                        f"{t_status.get('message', '当前不在A股交易时间。')}"
-                        "monitor_loop 保持运行，当前不扫描行情、不触发提醒；"
-                        + (
-                            f"按工作日规则将在 {next_open} 后恢复扫描。"
-                            if next_open else
-                            "等待下一个交易时段恢复扫描。"
-                        )
-                    ),
-                    "market_hours_only": True,
-                    "trading_time": t_status,
-                    "heartbeat": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "sleep_seconds": 300
-                })
-                time.sleep(300)
+            try:
+                cfg = load_watchlist_config()
+                monitor = cfg.get("monitor", {}) or {}
+                mode, profile = _get_monitor_profile(cfg)
+            except Exception:
+                print_json({"ok": False, "event": "monitor_config_blocked", "message": "盯盘配置不可用；已停止扫描和发送，请检查配置。"})
+                _monitor_wait(5)
                 continue
-
-            result = build_monitor_alerts_once()
-
-            if result.get("alerts_count", 0) > 0:
-                print_json(result)
-
-                alert_text = format_monitor_alerts_for_telegram(result)
-                if alert_text:
-                    cfg = load_watchlist_config()
-                    monitor = cfg.get("monitor", {}) or {}
-                    notify_result = send_monitor_notification(
-                        alert_text,
-                        channels=monitor.get("notify_channels"),
-                        source_channel=monitor.get("source_channel"),
-                    )
-                    cooldown_committed = False
-                    if notify_result.get("ok") is True:
-                        cooldown_committed = _commit_alert_cooldowns(
-                            result.get("alerts", [])
-                        )
-                    print_json({
-                        "ok": bool(notify_result.get("ok")),
-                        "event": "monitor_alert_sent",
-                        "notify_result": notify_result,
-                        "cooldown_committed": cooldown_committed,
-                        "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
-            else:
-                now_ts = time.time()
-                if mode != "strategy" or now_ts - last_idle_log >= 60:
-                    print_json({
-                        "ok": True,
-                        "monitor_enabled": True,
-                        "mode": mode,
-                        "profile_name": profile.get("name", mode),
-                        "checked_count": result.get("checked_count"),
-                        "alerts_count": 0,
-                        "runtime_unavailable": result.get("runtime_unavailable", []),
-                        "heartbeat": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
-                    last_idle_log = now_ts
-
-            interval_seconds = int(profile.get("interval_seconds", 60) or 60)
-            minimum_interval = 1 if mode == "strategy" else 15
-            time.sleep(max(minimum_interval, interval_seconds))
+            if not monitor.get("enabled"):
+                print_json({"ok": True, "message": "实时盯盘已关闭，monitor_loop 退出。"})
+                return
+            # Recovery is local-only and precedes the trading-session gate.
+            recovery = monitor_delivery_recover()
+            if not recovery.get("ok"):
+                print_json({"ok": False, "event": "monitor_delivery_blocked", "recovery": recovery})
+                _monitor_wait(5, mode)
+                continue
+            if recovery.get("cooldown_committed"):
+                notify_failures, retry_notification_at = 0, 0.0
+            if monitor.get("market_hours_only", True) and not trading_time_status().get("is_trading_time"):
+                if time.monotonic() - last_idle_log >= 60:
+                    print_json({"ok": True, "event": "market_closed", "trading_time": trading_time_status(), "sleep_seconds": 30})
+                    last_idle_log = time.monotonic()
+                _monitor_wait(30, mode)
+                continue
+            scan_started = time.monotonic()
+            try:
+                result = build_monitor_alerts_once()
+                if result.get("ok") is False:
+                    print_json({"ok": False, "event": "monitor_scan_not_committed", "message": "扫描状态不可用或保存失败，本轮不发送提醒。"})
+                    _monitor_wait(5, mode)
+                    continue
+                latest = load_watchlist_config()
+                latest_monitor = latest.get("monitor", {}) or {}
+                if (not latest_monitor.get("enabled") or latest_monitor.get("mode") != mode
+                        or latest.get("strategy_monitor") != cfg.get("strategy_monitor")):
+                    continue
+                if result.get("alerts_count", 0) > 0:
+                    print_json(result)
+                    if time.monotonic() >= retry_notification_at:
+                        batch = dict(result, alerts=result.get("alerts", [])[:10])
+                        alert_text = format_monitor_alerts_for_telegram(batch)
+                        if alert_text:
+                            notify_started = time.monotonic()
+                            notify_result = send_monitor_notification(
+                                alert_text, channels=_normalize_notify_channels(latest_monitor),
+                                source_channel=latest_monitor.get("source_channel"), alerts=batch["alerts"],
+                                expected_state_revision=batch.get("state_revision"))
+                            committed = bool(notify_result.get("cooldown_committed"))
+                            if committed:
+                                notify_failures, retry_notification_at = 0, 0.0
+                            elif not notify_result.get("blocked"):
+                                notify_failures += 1
+                                retry_notification_at = time.monotonic() + min(60, 5 * (2 ** min(notify_failures - 1, 4)))
+                            event = ("monitor_alert_sent" if notify_result.get("ok") else
+                                     "monitor_delivery_blocked" if notify_result.get("blocked") else "monitor_delivery_failed")
+                            print_json({"ok": bool(notify_result.get("ok")), "event": event,
+                                        "notify_result": notify_result, "cooldown_committed": committed,
+                                        "notification_duration_ms": round((time.monotonic() - notify_started) * 1000, 2)})
+                elif mode != "strategy" or time.monotonic() - last_idle_log >= 60:
+                    print_json({"ok": result.get("ok", True), "monitor_enabled": True, "mode": mode,
+                                "checked_count": result.get("checked_count"), "alerts_count": 0,
+                                "runtime_unavailable": result.get("runtime_unavailable", []),
+                                "scan_duration_ms": result.get("scan_duration_ms")})
+                    last_idle_log = time.monotonic()
+            except Exception:
+                print_json({"ok": False, "event": "monitor_iteration_failed", "error": "本轮检查失败，已停止发送并等待重新检查。"})
+                _monitor_wait(5, mode)
+                continue
+            minimum = 1 if mode == "strategy" else 15
+            interval = max(minimum, float(profile.get("interval_seconds", minimum) or minimum))
+            _monitor_wait(max(0.1, interval - (time.monotonic() - scan_started)), mode)
     finally:
         _cleanup_monitor_runtime(own_pid, lock_file)
+
 
 
 
@@ -5859,7 +7276,7 @@ def _process_command(pid):
     if os.path.exists(proc_cmdline):
         try:
             with open(proc_cmdline, "rb") as f:
-                return f.read().replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+                return [part.decode("utf-8", errors="replace") for part in f.read().split(b"\0") if part]
         except Exception:
             pass
 
@@ -5883,8 +7300,45 @@ def _is_monitor_process(pid):
     if not command:
         return False
     script_path = os.path.realpath(__file__)
-    script_names = {script_path, os.path.basename(script_path)}
-    return "monitor_loop" in command and any(name in command for name in script_names)
+    allowed_flags = {"-u", "-B", "-s", "-S", "-E", "-I", "-O", "-OO"}
+    def matches(args):
+        if len(args) < 3 or not re.fullmatch(r"python(?:[0-9.]+)?", os.path.basename(args[0]), re.I):
+            return False
+        script_index = len(args) - 2
+        return (
+            args[-1] == "monitor_loop"
+            and os.path.isabs(args[script_index])
+            and os.path.realpath(args[script_index]) == script_path
+            and all(arg in allowed_flags for arg in args[1:script_index])
+        )
+    # Linux preserves the true NUL-separated argv, including spaces in paths.
+    if isinstance(command, (list, tuple)):
+        return matches(command)
+    try:
+        if matches(shlex.split(command)):
+            return True
+    except ValueError:
+        return False
+    # macOS ps emits an unquoted command string. Match our exact known script
+    # boundary, then separately validate the interpreter, flags and subcommand.
+    for known_path in {script_path, os.path.abspath(__file__)}:
+        marker = " " + known_path + " "
+        if marker not in command:
+            continue
+        prefix, suffix = command.rsplit(marker, 1)
+        if suffix.strip() != "monitor_loop":
+            continue
+        if prefix in {sys.executable, sys.executable + " -u"}:
+            args = [sys.executable] + (["-u"] if prefix.endswith(" -u") else [])
+        else:
+            try:
+                args = shlex.split(prefix)
+            except ValueError:
+                continue
+        if matches(args + [known_path, "monitor_loop"]):
+            return True
+    return False
+
 
 
 def _cleanup_monitor_runtime(own_pid, lock_file=None):
@@ -5899,11 +7353,6 @@ def _cleanup_monitor_runtime(own_pid, lock_file=None):
             lock_file.seek(0)
             lock_file.truncate()
             lock_file.flush()
-        except Exception:
-            pass
-        try:
-            if os.path.exists(MONITOR_LOCK_PATH):
-                os.remove(MONITOR_LOCK_PATH)
         except Exception:
             pass
         try:
@@ -5992,6 +7441,9 @@ def monitor_start():
             "monitor": monitor
         }
 
+    recovery = monitor_delivery_recover()
+    if not recovery.get("ok"):
+        return {**recovery, "message": "通知或盯盘状态待恢复，未启动后台。请先查看 monitor delivery status 与 monitor diagnose。"}
     current_status = monitor_pid_status()
     if current_status.get("running"):
         return {
@@ -6051,6 +7503,7 @@ def monitor_start():
     }
 
 
+
 def monitor_stop():
     """
     停止后台 monitor_loop，并关闭 monitor.enabled。
@@ -6104,31 +7557,43 @@ def monitor_stop():
 
 
 def _report_cli_options(args, default_variant="full"):
-    options = {
-        "channel": _default_output_channel(),
-        "variant": default_variant,
-        "raw_json": False,
-        "remaining": [],
-    }
+    options = {"channel": _default_output_channel(), "variant": default_variant, "raw_json": False,
+               "remaining": [], "date": None, "symbol": None}
     index = 0
     while index < len(args):
         value = args[index]
-        if value == "--channel" and index + 1 < len(args):
-            options["channel"] = args[index + 1]
+        if value in {"--channel", "--date", "date", "--symbol"}:
+            if index + 1 >= len(args) or args[index + 1].startswith("--"):
+                raise ValueError(f"{value} 需要参数")
+            key = {"--channel": "channel", "--date": "date", "date": "date", "--symbol": "symbol"}[value]
+            options[key] = args[index + 1]
             index += 2
-        elif value == "--simple":
-            options["variant"] = "simple"
-            index += 1
-        elif value == "--full":
-            options["variant"] = "full"
+        elif value in {"--simple", "--full"}:
+            options["variant"] = value[2:]
             index += 1
         elif value in {"--json", "原始JSON"}:
             options["raw_json"] = True
             index += 1
+        elif value == "--lhb":
+            index += 1  # Compatibility: reports already include date-scoped LHB.
         else:
             options["remaining"].append(value)
             index += 1
+    for value in options["remaining"]:
+        if re.fullmatch(r"\d{4}[-/]?\d{2}[-/]?\d{2}", value):
+            if options["date"] is not None:
+                raise ValueError("请只指定一个复盘日期")
+            options["date"] = value
+        elif re.fullmatch(r"(?:sh|sz)?\d{6}", value, re.I):
+            if options["symbol"] is not None:
+                raise ValueError("请只指定一只复盘标的")
+            options["symbol"] = value
+        else:
+            raise ValueError("无法识别报告参数")
+    if options["date"] is not None:
+        options["date"] = _normalize_report_date(options["date"])
     return options
+
 
 
 def _parse_monitor_cli_args(args):
@@ -6137,17 +7602,19 @@ def _parse_monitor_cli_args(args):
     index = 0
     while index < len(args):
         value = args[index]
-        if value in {"--channel", "-c"} and index + 1 < len(args):
-            channel = args[index + 1]
+        if value in {"--channel", "-c"}:
+            if channel is not None or index + 1 >= len(args):
+                raise ValueError("notification_channel_argument_invalid")
+            channel = _validated_notify_channel(args[index + 1])
             index += 2
-        elif value.startswith("--"):
+        elif value == "--json":
             index += 1
-        elif mode is None:
+        elif value.startswith("--") or mode is not None:
+            raise ValueError("notification_channel_argument_invalid")
+        else:
             mode = value
             index += 1
-        else:
-            index += 1
-    return mode, _normalize_channel_name(channel or _default_output_channel())
+    return mode, channel
 
 
 def _print_report_result(result, raw_json=False):
@@ -6155,6 +7622,107 @@ def _print_report_result(result, raw_json=False):
         print_json({key: value for key, value in result.items() if key != "text"})
     else:
         print(result.get("text", ""))
+
+
+def _dispatch_auxiliary_market_command(command, args):
+    """Return a result for documented market commands, or None for other routes."""
+    supported = {"kline", "news_map", "morning_news", "us_quote", "us_index", "lhb"}
+    if command not in supported:
+        return None
+    args = list(args)
+
+    if command == "lhb":
+        if len(args) > 1:
+            raise ValueError("用法：lhb [YYYYMMDD 或六位证券代码]")
+        if not args:
+            return lhb(emit=False)
+        value = str(args[0]).strip()
+        if re.fullmatch(r"[0-9]{8}", value):
+            datetime.strptime(value, "%Y%m%d")
+            return lhb(date=value, emit=False)
+        if re.fullmatch(r"(?:(?:sh|sz))?[0-9]{6}", value, re.I) or _is_index_or_etf(value):
+            return lhb(symbol=value, emit=False)
+        raise ValueError("龙虎榜参数应为有效 YYYYMMDD 日期或六位证券代码")
+
+    if command == "kline":
+        from backtest.data_provider import load_bars, resolve_range
+        from zoneinfo import ZoneInfo
+        if len(args) != 2 or not re.fullmatch(r"[0-9]{6}", str(args[0])):
+            raise ValueError("用法：kline 六位证券代码 天数（1 至 1000）")
+        if not re.fullmatch(r"[0-9]{1,4}", str(args[1])) or not 1 <= int(args[1]) <= 1000:
+            raise ValueError("K线天数必须是 1 至 1000 的整数")
+        symbol, count = args[0], int(args[1])
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+        start, end = resolve_range(count, None, today)
+        data = load_bars(symbol, "1d", start, end, timeout_seconds=5)
+        bars = [row for row in data.get("bars", []) if start <= str(row.get("time", ""))[:10] <= end][-count:]
+        if not bars:
+            return {"ok": False, "command": command, "error": "请求区间暂无可用K线", "source": data.get("source")}
+        warnings = []
+        if len(bars) < count:
+            warnings.append(f"仅有 {len(bars)} 根可用K线，少于请求的 {count} 根；未补造缺失行情")
+        if bars[-1]["time"][:10] == today:
+            warnings.append("包含当日日K；交易结束前该根K线可能尚未完成")
+        if data.get("cache_stale"):
+            warnings.append("当前使用过期缓存，请核验行情时间")
+        return {
+            "ok": True, "command": command, "symbol": symbol, "interval": "1d",
+            "requested_bars": count, "count": len(bars), "bars": bars,
+            "available_start": bars[0]["time"], "available_end": bars[-1]["time"],
+            "source": data.get("source"), "original_source": data.get("original_source"),
+            "volume_unit": data.get("volume_unit"), "amount_unit": data.get("amount_unit"),
+            "price_adjustment": data.get("price_adjustment"),
+            "used_cache": bool(data.get("used_cache")), "cache_stale": bool(data.get("cache_stale")),
+            "cache_time": data.get("cache_time"), "fallback_errors": data.get("fallback_errors", []),
+            "warnings": warnings,
+        }
+
+    if command == "news_map":
+        text = " ".join(str(value) for value in args).strip()
+        if not text or len(text) > 12000:
+            raise ValueError("用法：news_map 新闻内容（1 至 12000 字符）")
+        mapping = _load_news_stock_map()
+        if not isinstance(mapping, dict) or not mapping:
+            return {"ok": False, "command": command, "error": "新闻题材映射表暂缺或格式错误"}
+        matches = _match_news_to_stocks([text])
+        keywords = []
+        for item in mapping.values():
+            if isinstance(item, dict):
+                keywords.extend(word for word in item.get("keywords", []) if isinstance(word, str) and word.lower() in text.lower())
+        return {
+            "ok": True, "command": command, "matches": matches,
+            "matched_keywords": list(dict.fromkeys(keywords)), "source": "用户提供文本 + 本地关键词映射表",
+            "note": "仅为关键词题材关联；泛泛关键词相关性较弱，未核验催化强度，不等于买卖建议",
+        }
+
+    if command == "morning_news":
+        if len(args) > 1 or (args and not re.fullmatch(r"[0-9]{1,2}", str(args[0]))):
+            raise ValueError("用法：morning_news [条数，1 至 50]")
+        limit = int(args[0]) if args else 10
+        if not 1 <= limit <= 50:
+            raise ValueError("新闻条数必须为 1 至 50 的整数")
+        from datetime import timezone
+        headlines = news(limit=limit)
+        if not headlines:
+            return {"ok": False, "command": command, "error": "新闻源暂未返回可用标题"}
+        mapping = _load_news_stock_map()
+        mapping_available = isinstance(mapping, dict) and bool(mapping)
+        return {
+            "ok": True, "command": command, "headlines": headlines,
+            "matches": _match_news_to_stocks(headlines) if mapping_available else [],
+            "mapping_available": mapping_available,
+            "source": "现有网页标题抓取链（财联社／新浪备用；逐条来源未返回）",
+            "fetched_at": datetime.now(timezone.utc).isoformat(), "published_at": None,
+            "warnings": ["抓取时间不等于新闻发布时间；未核验全部标题均为当日新闻", "仅为关键词题材映射，不等于买卖建议"] + ([] if mapping_available else ["题材映射表暂缺"]),
+        }
+
+    if command == "us_quote":
+        if len(args) != 1 or not re.fullmatch(r"[A-Za-z^][A-Za-z0-9.^-]{0,14}", str(args[0])):
+            raise ValueError("用法：us_quote 美股代码，例如 AAPL 或 NVDA")
+        return quote_us(args[0])
+    if args:
+        raise ValueError("用法：us_index（不接受额外参数）")
+    return us_index()
 
 
 def main():
@@ -6170,6 +7738,10 @@ def main():
 
     cmd = sys.argv[1]
     try:
+        auxiliary = _dispatch_auxiliary_market_command(cmd, sys.argv[2:])
+        if auxiliary is not None:
+            print_json(auxiliary)
+            return
         if cmd in {"demo", "synthetic-demo", "合成演示"}:
             print_json(synthetic_demo())
         elif cmd in {"nl", "自然语言"}:
@@ -6221,8 +7793,11 @@ def main():
                     True,
                     mode=mode,
                     source_channel=channel,
-                    notify_channels=[channel],
+                    notify_channels=[channel] if channel is not None else None,
                 )
+                if not set_result.get("ok"):
+                    print_json(set_result)
+                    return
                 start_result = monitor_start()
                 verify_result = monitor_verify(expected_running=True, wait_seconds=1.2)
                 print_json({
@@ -6250,6 +7825,8 @@ def main():
                     print(result.get("text", ""))
                 else:
                     print_json(result)
+            elif action == "delivery":
+                print_json(monitor_delivery_command(sys.argv[3:]))
             elif action in {"diagnose", "诊断"}:
                 text = " ".join(sys.argv[3:]).strip()
                 result = monitor_diagnose(raw_json=_monitor_raw_output_requested(text))
@@ -6258,10 +7835,10 @@ def main():
                 else:
                     print_json(result)
             elif action in {"notify-test", "通知测试"}:
-                channel = _monitor_channel_arg(sys.argv[3:], default="weixin")
+                channel = _monitor_channel_arg(sys.argv[3:])
                 print_json(monitor_notify_test(channel))
             elif action in {"simulate-alert", "模拟提醒"}:
-                channel = _monitor_channel_arg(sys.argv[3:], default="weixin")
+                channel = _monitor_channel_arg(sys.argv[3:])
                 print_json(monitor_simulate_alert(channel))
             else:
                 print_json({"error": f"未知盯盘操作：{action}"})
@@ -6372,17 +7949,7 @@ def main():
             else:
                 print_json({"error": f"未知回测操作：{action}"})
         elif cmd == "model":
-            action = sys.argv[2] if len(sys.argv) > 2 else "ping"
-            if action == "ping":
-                print_json(model_ping())
-            elif action in {"ask", "run"}:
-                prompt = " ".join(sys.argv[3:]).strip()
-                if not prompt:
-                    print_json({"error": "用法：model ask \"需要模型处理的文本\""})
-                else:
-                    print_json(model_call_with_fallback(prompt))
-            else:
-                print_json({"error": f"未知模型操作：{action}"})
+            print_json(_dispatch_model_command(sys.argv[2:]))
         elif cmd in {"monitor_once", "盯盘一次"}:
             monitor_once()
         elif cmd in {"monitor_loop", "盯盘循环"}:
@@ -6404,52 +7971,18 @@ def main():
                 lhb(symbol=sys.argv[2], emit=True)
         elif cmd in {"morning_report", "morning", "盘前", "盘前报告"}:
             options = _report_cli_options(sys.argv[2:], default_variant="full")
-            result = report_output(
-                "morning_report",
-                variant=options["variant"],
-                channel=options["channel"],
-            )
+            result = report_output("morning_report", variant=options["variant"], channel=options["channel"], date=options["date"])
             _print_report_result(result, options["raw_json"])
-        elif cmd in {"after_simple", "simple_after", "复盘简洁版", "简单复盘"}:
-            options = _report_cli_options(sys.argv[2:], default_variant="simple")
-            result = report_output(
-                "after_close_report",
-                variant=options["variant"],
-                channel=options["channel"],
-            )
-            _print_report_result(result, options["raw_json"])
-        elif cmd in {"after_full", "full_after", "复盘完整版", "完整复盘"}:
-            options = _report_cli_options(sys.argv[2:], default_variant="full")
-            result = report_output(
-                "after_close_report",
-                variant=options["variant"],
-                channel=options["channel"],
-            )
-            _print_report_result(result, options["raw_json"])
-        elif cmd in {"after_close_report", "after"}:
-            options = _report_cli_options(sys.argv[2:], default_variant="full")
-            args = [a for a in options["remaining"] if a != "--lhb"]
-            symbol = None
-            date = None
-            if args:
-                if args[0] in {"date", "--date"} and len(args) > 1:
-                    date = args[1]
-                elif len(args[0]) == 8 and args[0].isdigit():
-                    date = args[0]
-                else:
-                    symbol = args[0]
-            result = report_output(
-                "after_close_report",
-                variant=options["variant"],
-                channel=options["channel"],
-                date=date,
-                symbol=symbol,
-            )
+        elif cmd in {"after_simple", "simple_after", "复盘简洁版", "简单复盘", "after_full", "full_after", "复盘完整版", "完整复盘", "after_close_report", "after"}:
+            default_variant = "simple" if cmd in {"after_simple", "simple_after", "复盘简洁版", "简单复盘"} else "full"
+            options = _report_cli_options(sys.argv[2:], default_variant=default_variant)
+            result = report_output("after_close_report", variant=options["variant"], channel=options["channel"], date=options["date"], symbol=options["symbol"])
             _print_report_result(result, options["raw_json"])
         else:
             print_json({"error": f"未知命令：{cmd}"})
     except Exception as e:
         print_json({"error": str(e)})
+
 
 
 if __name__ == "__main__":

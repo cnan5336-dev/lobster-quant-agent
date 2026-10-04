@@ -1,4 +1,4 @@
-test_*.py
+# The package files allowlist includes scripts/, so exclusions must also live here.
 **/__pycache__/
 **/*.py[cod]
 

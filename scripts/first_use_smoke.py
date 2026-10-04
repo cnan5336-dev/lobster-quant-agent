@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack
 from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
@@ -35,7 +38,15 @@ def synthetic_bars(count: int = 65):
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="lobster-first-use-") as state_dir:
+    blocked_activity = []
+    def block_external(*args, **kwargs):
+        blocked_activity.append(True)
+        raise AssertionError("The synthetic smoke test must not use network or subprocesses")
+
+    with ExitStack() as guards, tempfile.TemporaryDirectory(prefix="lobster-first-use-") as state_dir:
+        guards.enter_context(mock.patch.object(socket, "getaddrinfo", side_effect=block_external))
+        guards.enter_context(mock.patch.object(socket.socket, "connect", side_effect=block_external))
+        guards.enter_context(mock.patch.object(subprocess, "Popen", side_effect=block_external))
         os.environ["LOBSTER_QUANT_HOME"] = state_dir
         os.environ["LOBSTER_QUANT_NOTIFY_CHANNELS"] = ""
         os.environ["LOBSTER_QUANT_NOTIFY_TARGETS"] = "{}"
@@ -77,6 +88,8 @@ def main() -> int:
                 "CN-DEMO",
                 days=60,
                 interval="1d",
+                start=data["bars"][0]["time"],
+                end=data["bars"][-1]["time"],
                 strategy_override=parsed,
             )
         assert backtest["data_source"] == "synthetic_offline"
@@ -86,6 +99,7 @@ def main() -> int:
         assert delivery["ok"] is False
         assert delivery["skipped"] is True
         assert "未配置通知目标" in delivery["error"]
+        assert not blocked_activity, "A forbidden external call was attempted"
 
         print(json.dumps({
             "ok": True,

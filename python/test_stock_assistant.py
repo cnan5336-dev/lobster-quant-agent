@@ -206,7 +206,7 @@ class ReportPipelineTests(unittest.TestCase):
                 "result": [{
                     "meta": {
                         "regularMarketPrice": 201.5,
-                        "chartPreviousClose": 200,
+                        "previousClose": 200,
                         "currency": "USD",
                         "exchangeName": "NMS",
                     }

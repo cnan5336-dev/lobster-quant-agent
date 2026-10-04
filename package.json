@@ -54,6 +54,7 @@
     "SECURITY.md",
     "DISCLAIMER.md",
     "docs/demo",
+    "docs/model-traffic-switch.md",
     "LICENSE"
   ],
   "engines": {
@@ -73,7 +74,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.9.0",
-    "vitest": "^3.2.0"
+    "vitest": "4.1.11"
   },
   "openclaw": {
     "extensions": [

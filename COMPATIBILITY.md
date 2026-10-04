@@ -40,3 +40,13 @@ Before installation, review the public ClawHub version, source link, compatibili
 - Real channel delivery requires user-owned OpenClaw channel configuration and an explicit private notification target.
 - Missing notification targets fail closed.
 - No supported configuration enables broker access or order execution.
+
+## Reliability update behavior
+
+- Strategy setup remains separate from starting monitoring. A successful parse now includes the exact supported conditions and defaults in `confirmation`; unsupported negation, mixed AND/OR groups, temporal sequences and crossing events require clarification rather than a guessed strategy. Existing saved DSL remains readable.
+- Monitoring fetches only required sources. The configured interval targets scan-start cadence, not one-second end-to-end delivery. Source and notification latency still apply. A quote with a missing, future or stale timestamp is unavailable for live signals.
+- A notification is considered delivered when at least one configured channel succeeds. Diagnostics retain individual channel outcomes. There is no durable outbox: a transient signal that disappears while every channel is unavailable is not replayed later.
+- Historical reports do not substitute today's quotes or market breadth. Historical pool reports use the current pool membership and label that limitation. News without a verified publication timestamp remains explicitly unverified.
+- Backtests use a conservative T+1 assumption for all symbols, whole lots, configured costs and slippage. They do not model T+0 products, exchange queues, corporate actions or complete instrument-specific fees. Signals use completed bars and fill no earlier than the next eligible bar open; end-of-run valuation assumptions are disclosed in results; do not treat them as executable performance.
+- Explicit `model ask` / `model ping` helpers require a host providing `openclaw infer model run` (manually verified on `2026.7.1-2`). They inherit the default model unless explicitly configured, send only the supplied prompt, and never fall back to a tool-enabled agent. Hosts without that command return a clear unsupported error; the other tools retain their declared minimum host version.
+- The optional `scripts/start-market-monitor.sh` restores only an already-enabled monitor. It reads machine-readable status and delegates process identity and locking to the CLI. Installing a scheduler remains an explicit operator action.

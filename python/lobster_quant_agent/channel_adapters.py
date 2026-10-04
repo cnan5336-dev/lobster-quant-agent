@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 
 
 def _clean(value):
-    text = " ".join(str(value or "").split())
+    text = " ".join(str(value if value is not None else "").split())
     return text or "暂无数据"
 
 
@@ -29,7 +29,8 @@ class TelegramAdapter(ChannelAdapter):
         lines = [
             f"# {_clean(analysis.get('title'))}",
             f"状态：{_clean(analysis.get('status'))}",
-            f"时间：{_clean(analysis.get('generated_at'))}",
+            f"生成时间：{_clean(analysis.get('generated_at'))}",
+            f"报告日期：{_clean(analysis.get('report_date'))}",
             "",
             f"核心结论：{_clean(analysis.get('summary'))}",
         ]
@@ -51,7 +52,8 @@ class WeixinAdapter(ChannelAdapter):
     def render_report(self, analysis):
         lines = [
             _clean(analysis.get("title")),
-            f"{_clean(analysis.get('generated_at'))}｜{_clean(analysis.get('status'))}",
+            f"生成于 {_clean(analysis.get('generated_at'))}｜{_clean(analysis.get('status'))}",
+            f"报告日期：{_clean(analysis.get('report_date'))}",
             "",
             "【先看结论】",
             _short(analysis.get("summary"), 240),

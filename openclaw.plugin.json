@@ -32,7 +32,7 @@
       },
       "primaryModel": {
         "type": "string",
-        "description": "OpenClaw model key used first for model-assisted tasks."
+        "description": "OpenClaw model key used first for model-assisted tasks; omit to inherit the current OpenClaw default."
       },
       "fallbackModels": {
         "type": "array",

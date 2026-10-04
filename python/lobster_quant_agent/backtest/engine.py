@@ -1,10 +1,11 @@
 import hashlib
+import math
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import load_config, save_last_result
-from .data_provider import load_bars, resolve_range
+from .data_provider import load_bars, resolve_range, _validate_bars
 from .metrics import calculate_metrics
 from .models import BacktestResult, TradeRecord
 
@@ -21,6 +22,16 @@ def _condition(kind: str, **kwargs) -> Dict[str, Any]:
     return data
 
 
+_COMPARISON_WORDS = {
+    "超过": ">", "高于": ">", "大于": ">",
+    "达到": ">=", "不少于": ">=", "不低于": ">=",
+    "低于": "<", "小于": "<", "跌破": "<",
+    "不超过": "<=", "不高于": "<=", "至多": "<=",
+}
+_COMPARISON_PATTERN = "|".join(_COMPARISON_WORDS)
+_NUMBER_PATTERN = r"([0-9]+(?:\.[0-9]+)?)"
+
+
 def _parse_atom(text: str, side: str) -> Optional[Dict[str, Any]]:
     atom = re.sub(r"^(如果|当|若)", "", str(text).strip())
     atom = re.sub(r"(时|的时候)$", "", atom).strip()
@@ -28,13 +39,13 @@ def _parse_atom(text: str, side: str) -> Optional[Dict[str, Any]]:
     compact = re.sub(r"\s+", "", atom)
     upper = compact.upper()
 
-    if "MACD金叉" in upper:
+    if upper == "MACD金叉":
         return _condition("macd_cross", direction="golden_cross")
-    if "MACD死叉" in upper:
+    if upper == "MACD死叉":
         return _condition("macd_cross", direction="death_cross")
-    if "KDJ金叉" in upper:
+    if upper == "KDJ金叉":
         return _condition("kdj_cross", direction="golden_cross")
-    if "KDJ死叉" in upper:
+    if upper == "KDJ死叉":
         return _condition("kdj_cross", direction="death_cross")
 
     rolling_high = re.fullmatch(
@@ -42,62 +53,56 @@ def _parse_atom(text: str, side: str) -> Optional[Dict[str, Any]]:
         compact,
         re.I
     )
-    if rolling_high:
+    if rolling_high and 1 <= int(rolling_high.group(1)) <= 10000:
         return _condition(
             "rolling_high_breakout",
             lookback=int(rolling_high.group(1))
         )
 
     volume = re.fullmatch(
-        r"成交量(?:超过|高于)?(?:过去|近)(\d+)(?:天|日|根|根K线?)均量(?:的)?([0-9.]+)倍",
+        rf"成交量({_COMPARISON_PATTERN})(?:过去|近)(\d+)(?:天|日|根|根K线?)均量(?:的)?{_NUMBER_PATTERN}倍",
         compact
     )
-    if volume:
+    if volume and 1 <= int(volume.group(2)) <= 10000 and float(volume.group(3)) > 0:
         return _condition(
-            "volume_vs_average",
-            lookback=int(volume.group(1)),
-            factor=float(volume.group(2)),
-            operator=">="
+            "volume_vs_average", lookback=int(volume.group(2)),
+            factor=float(volume.group(3)), operator=_COMPARISON_WORDS[volume.group(1)]
         )
-    if compact == "放量":
-        return _condition("volume_vs_average", lookback=5, factor=1.5, operator=">=")
-    if compact == "缩量":
-        return _condition("volume_vs_average", lookback=5, factor=0.7, operator="<=")
+    # Relative volume must name its window and multiplier; do not invent thresholds.
 
     bar_return = re.fullmatch(
-        r"(?:收盘价|单日|当日|本K线)?(?:上涨|涨幅)(?:超过|高于|大于)([0-9.]+)%",
+        rf"(?:收盘价|单日|当日|本K线)?(?:上涨|涨幅)({_COMPARISON_PATTERN}){_NUMBER_PATTERN}%",
         compact
     )
     if bar_return:
         return _condition(
-            "bar_return",
-            operator=">",
-            value=float(bar_return.group(1))
+            "bar_return", operator=_COMPARISON_WORDS[bar_return.group(1)],
+            value=float(bar_return.group(2))
         )
 
     stop_patterns = (
-        r"买入价止损([0-9.]+)%",
-        r"止损([0-9.]+)%",
-        r"跌破买入价([0-9.]+)%",
-        r"亏损(?:超过|达到|大于)([0-9.]+)%",
-        r"相对买入价(?:下跌|跌幅)(?:超过|达到|大于)?([0-9.]+)%",
-        r"回撤到买入价以下([0-9.]+)%",
+        r"买入价止损([0-9]+(?:\.[0-9]+)?)%",
+        r"止损([0-9]+(?:\.[0-9]+)?)%",
+        r"跌破买入价([0-9]+(?:\.[0-9]+)?)%",
+        r"亏损(?:超过|达到|大于)([0-9]+(?:\.[0-9]+)?)%",
+        r"相对买入价(?:下跌|跌幅)(?:超过|达到|大于)?([0-9]+(?:\.[0-9]+)?)%",
+        r"回撤到买入价以下([0-9]+(?:\.[0-9]+)?)%",
     )
     for pattern in stop_patterns:
         match = re.fullmatch(pattern, compact)
         if match:
             return _condition(
                 "entry_return",
-                operator="<=",
+                operator="<" if any(word in compact for word in ("超过", "大于", "跌破")) else "<=",
                 value=-float(match.group(1))
             )
 
     profit_patterns = (
-        r"买入价止盈([0-9.]+)%",
-        r"上涨(?:超过|达到|大于)([0-9.]+)%",
-        r"盈利(?:超过|达到|大于)([0-9.]+)%",
-        r"涨到买入价上方([0-9.]+)%",
-        r"(?:超过|高于)买入价([0-9.]+)%",
+        r"买入价止盈([0-9]+(?:\.[0-9]+)?)%",
+        r"上涨(?:超过|达到|大于)([0-9]+(?:\.[0-9]+)?)%",
+        r"盈利(?:超过|达到|大于)([0-9]+(?:\.[0-9]+)?)%",
+        r"涨到买入价上方([0-9]+(?:\.[0-9]+)?)%",
+        r"(?:超过|高于)买入价([0-9]+(?:\.[0-9]+)?)%",
     )
     if side == "sell":
         for pattern in profit_patterns:
@@ -105,22 +110,15 @@ def _parse_atom(text: str, side: str) -> Optional[Dict[str, Any]]:
             if match:
                 return _condition(
                     "entry_return",
-                    operator=">=",
+                    operator=">" if any(word in compact for word in ("超过", "大于", "高于")) else ">=",
                     value=float(match.group(1))
                 )
 
-    rsi = re.fullmatch(
-        r"RSI(?:高于|大于|超过|低于|小于)([0-9.]+)",
-        compact,
-        re.I
-    )
+    rsi = re.fullmatch(rf"RSI({_COMPARISON_PATTERN}){_NUMBER_PATTERN}", compact, re.I)
     if rsi:
-        operator = "<" if any(word in compact for word in ("低于", "小于")) else ">"
         return _condition(
-            "indicator_threshold",
-            indicator="rsi",
-            operator=operator,
-            value=float(rsi.group(1))
+            "indicator_threshold", indicator="rsi",
+            operator=_COMPARISON_WORDS[rsi.group(1)], value=float(rsi.group(2))
         )
 
     ma = re.fullmatch(
@@ -128,7 +126,7 @@ def _parse_atom(text: str, side: str) -> Optional[Dict[str, Any]]:
         compact,
         re.I
     )
-    if ma:
+    if ma and 1 <= int(ma.group(2)) <= 10000:
         return _condition(
             "price_vs_ma",
             period=int(ma.group(2)),
@@ -136,12 +134,10 @@ def _parse_atom(text: str, side: str) -> Optional[Dict[str, Any]]:
         )
 
     price = re.fullmatch(
-        r"(?:价格|股价|收盘价)(?:大于|高于|超过|小于|低于|跌破)([0-9.]+)",
-        compact
+        rf"(?:价格|股价|收盘价)({_COMPARISON_PATTERN}){_NUMBER_PATTERN}(?:元)?", compact
     )
     if price:
-        operator = "<" if any(word in compact for word in ("小于", "低于", "跌破")) else ">"
-        return _condition("price_threshold", operator=operator, value=float(price.group(1)))
+        return _condition("price_threshold", operator=_COMPARISON_WORDS[price.group(1)], value=float(price.group(2)))
     return None
 
 
@@ -150,6 +146,8 @@ def _parse_expression(text: str, side: str) -> Tuple[List[Dict[str, Any]], List[
     if not expression:
         return [], []
 
+    if re.search(r"(?:或者|或是|或|并且|而且|同时|且)\s*$", expression):
+        return [], [expression]
     or_parts = [
         item.strip()
         for item in re.split(r"或者|或是|或", expression)
@@ -240,7 +238,12 @@ def parse_strategy(text: str) -> Dict[str, Any]:
     if not buy_conditions:
         return {"ok": False, "error": "未识别到可执行的买入条件。"}
     if not sell_conditions:
-        sell_conditions = [_condition("entry_return", operator="<=", value=-5.0)]
+        return {"ok": False, "error": "请明确卖出条件；回测不会自动补入止损比例。"}
+    try:
+        _validate_conditions(buy_conditions, "buy")
+        _validate_conditions(sell_conditions, "sell")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     return {
         "ok": True,
         "raw_text": raw,
@@ -258,7 +261,54 @@ def _ema(values: List[float], period: int) -> List[float]:
     return output
 
 
-def _prepare_bars(bars: List[Dict[str, Any]]) -> None:
+def _validate_conditions(conditions, side):
+    if not isinstance(conditions, list) or not conditions:
+        raise ValueError(f"回测{side}条件不能为空")
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            raise ValueError("回测条件格式错误")
+        kind = condition.get("type")
+        if kind in {"all", "any"}:
+            _validate_conditions(condition.get("conditions"), side)
+            continue
+        if kind not in {"macd_cross", "kdj_cross", "indicator_threshold", "price_vs_ma", "volume_vs_average", "bar_return", "rolling_high_breakout", "entry_return", "price_threshold"}:
+            raise ValueError(f"不支持回测条件：{kind}")
+        if kind.endswith("_cross") and condition.get("direction") not in {"golden_cross", "death_cross"}:
+            raise ValueError("不支持的交叉方向")
+        if kind == "entry_return" and side == "buy":
+            raise ValueError("买入条件不能依赖尚不存在的持仓收益")
+        if kind == "indicator_threshold" and condition.get("indicator") != "rsi":
+            raise ValueError("不支持的回测指标")
+        if kind in {"price_vs_ma", "volume_vs_average", "rolling_high_breakout"}:
+            key = "period" if kind == "price_vs_ma" else "lookback"
+            number = condition.get(key)
+            if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= 10000:
+                raise ValueError("历史窗口必须为 1 至 10000 的整数")
+        if kind in {"indicator_threshold", "price_vs_ma", "volume_vs_average", "bar_return", "entry_return", "price_threshold"}:
+            if condition.get("operator") not in {">", ">=", "<", "<="}:
+                raise ValueError("不支持的回测比较符")
+        if kind in {"indicator_threshold", "volume_vs_average", "bar_return", "entry_return", "price_threshold"}:
+            key = "factor" if kind == "volume_vs_average" else "value"
+            number = condition.get(key)
+            if not isinstance(number, (int, float)) or isinstance(number, bool) or not math.isfinite(number):
+                raise ValueError("回测阈值必须是有限数值")
+            if kind in {"volume_vs_average", "price_threshold"} and number <= 0:
+                raise ValueError("成交量倍数和价格阈值必须大于零")
+            if kind == "indicator_threshold" and not 0 <= number <= 100:
+                raise ValueError("RSI 阈值必须在 0 至 100 之间")
+
+
+def _ma_periods(conditions):
+    periods = set()
+    for condition in conditions:
+        if condition["type"] == "price_vs_ma":
+            periods.add(condition["period"])
+        elif condition["type"] in {"all", "any"}:
+            periods.update(_ma_periods(condition["conditions"]))
+    return periods
+
+
+def _prepare_bars(bars: List[Dict[str, Any]], ma_periods=None) -> None:
     closes = [bar["close"] for bar in bars]
     ema12 = _ema(closes, 12)
     ema26 = _ema(closes, 26)
@@ -269,7 +319,7 @@ def _prepare_bars(bars: List[Dict[str, Any]]) -> None:
         bar["dif"] = dif[index]
         bar["dea"] = dea[index]
         bar["macd"] = 2 * (dif[index] - dea[index])
-        for period in (5, 10, 20, 30, 60):
+        for period in ({5, 10, 20, 30, 60} | set(ma_periods or [])):
             bar[f"ma{period}"] = (
                 sum(closes[index - period + 1:index + 1]) / period
                 if index + 1 >= period else None
@@ -294,6 +344,8 @@ def _prepare_bars(bars: List[Dict[str, Any]]) -> None:
 def _compare(left: Optional[float], operator: str, right: float) -> bool:
     if left is None or right is None:
         return False
+    if math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12):
+        left = right
     return {
         ">": left > right,
         ">=": left >= right,
@@ -347,7 +399,9 @@ def _evaluate(
         if index < lookback:
             return False, "均量历史不足"
         average = sum(item["volume"] for item in bars[index - lookback:index]) / lookback
-        ratio = bar["volume"] / average if average else 0
+        if average <= 0:
+            return False, "历史均量为零，无法比较倍数"
+        ratio = bar["volume"] / average
         return (
             _compare(ratio, condition["operator"], condition["factor"]),
             (
@@ -412,12 +466,15 @@ def run_backtest(
     sell_conditions = strategy.get("sell_conditions", [])
     if not buy_conditions:
         raise RuntimeError("尚未设置回测策略，请先执行 backtest set。")
+    _validate_conditions(buy_conditions, "buy")
+    _validate_conditions(sell_conditions, "sell")
     start_date, end_date = resolve_range(days, start, end)
     data = load_bars(symbol, interval, start_date, end_date)
-    bars = data["bars"]
-    if interval == "1d" and days:
+    bars = _validate_bars(data["bars"], data.get("source", "历史行情"))
+    bars = [bar for bar in bars if start_date <= bar["time"][:10] <= end_date]
+    if interval == "1d" and days and not start:
         bars = bars[-days:]
-    if interval in {"1m", "5m"} and days:
+    if interval in {"1m", "5m"} and days and not start:
         unique_dates = sorted({bar["time"][:10] for bar in bars})
         if len(unique_dates) < days:
             raise RuntimeError(
@@ -428,12 +485,14 @@ def run_backtest(
         bars = [bar for bar in bars if bar["time"][:10] in selected]
     if len(bars) < 3:
         raise RuntimeError(f"历史K线数量不足：仅 {len(bars)} 根")
-    _prepare_bars(bars)
+    _prepare_bars(bars, _ma_periods(buy_conditions + sell_conditions))
 
     defaults = config.get("defaults", {})
     initial = float(defaults.get("initial_capital", 100000))
     commission = float(defaults.get("commission_rate", 0.0003))
     slippage = float(defaults.get("slippage_rate", 0.0002))
+    if not math.isfinite(initial) or initial <= 0 or not 0 <= commission < 1 or not 0 <= slippage < 1:
+        raise ValueError("初始资金必须为正数，佣金与滑点必须为 [0, 1) 内有限比例")
     cash = initial
     quantity = 0
     entry_price = None
@@ -446,7 +505,13 @@ def run_backtest(
     equity_curve = []
 
     for index, bar in enumerate(bars):
-        if pending and pending["execute_index"] == index:
+        if pending and pending["execute_index"] <= index:
+            # Conservative T+1 model for the supported domestic shares/ETFs.
+            sell_locked = pending["side"] == "sell" and entry_time and bar["time"][:10] <= entry_time[:10]
+            if bar["volume"] <= 0 or sell_locked:
+                pending["execute_index"] = index + 1
+                equity_curve.append({"time": bar["time"], "equity": round(cash + quantity * bar["close"], 2)})
+                continue
             if pending["side"] == "buy" and quantity == 0:
                 entry_equity = cash
                 fill = bar["open"] * (1 + slippage)
@@ -504,7 +569,7 @@ def run_backtest(
                     "reason": "；".join(reasons),
                 }
 
-    if quantity > 0:
+    if quantity > 0 and bars[-1]["time"][:10] > entry_time[:10] and bars[-1]["volume"] > 0:
         bar = bars[-1]
         fill = bar["close"] * (1 - slippage)
         proceeds = quantity * fill
@@ -528,7 +593,23 @@ def run_backtest(
         quantity = 0
         equity_curve[-1]["equity"] = round(cash, 2)
 
-    metrics = calculate_metrics(initial, cash, trades, equity_curve)
+    final_equity = cash + quantity * bars[-1]["close"]
+    metrics = calculate_metrics(initial, final_equity, trades, equity_curve)
+    assumptions = {
+        "signal_timing": "收盘确认信号，最早下一根开盘成交",
+        "settlement": "保守 T+1：买入当日不卖出；不适用于需要 T+0 的策略",
+        "lot_size": 100,
+        "limitations": ["未模拟涨跌停封单成交、逐笔流动性、印花税、分红送转权益及不同证券最小申报数量"],
+        "price_adjustment": data.get("price_adjustment", "unknown"),
+        "volume_unit": data.get("volume_unit", "unknown"),
+    }
+    if data.get("price_adjustment") != "qfq":
+        assumptions["limitations"].append("历史价格未确认前复权，除权除息可能影响收益与信号")
+    open_position = None if quantity == 0 else {
+        "quantity": quantity, "entry_time": entry_time, "entry_price": entry_price,
+        "mark_price": bars[-1]["close"], "unrealized": True,
+        "reason": "期末无法满足 T+1 或有效成交量条件，保留持仓按收盘价估值",
+    }
     result_id = hashlib.sha1(
         f"{symbol}:{interval}:{start_date}:{end_date}:{datetime.now().isoformat()}".encode()
     ).hexdigest()[:16]
@@ -540,7 +621,7 @@ def run_backtest(
         end=bars[-1]["time"],
         strategy_text=strategy.get("raw_text", ""),
         initial_capital=initial,
-        final_equity=round(cash, 2),
+        final_equity=round(final_equity, 2),
         metrics=metrics,
         trades=trades,
         bars=bars,
@@ -552,8 +633,10 @@ def run_backtest(
         completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
     result_dict = result.to_dict()
+    result_dict.update(execution_assumptions=assumptions, open_position=open_position, cash=round(cash, 2))
     result_path = save_last_result(result_dict)
     summary = result.to_dict(include_bars=False)
+    summary.update(execution_assumptions=assumptions, open_position=open_position, cash=round(cash, 2))
     summary["result_path"] = result_path
     summary["trade_summary"] = [trade.to_dict() for trade in trades[:20]]
     summary["回测指标"] = {
