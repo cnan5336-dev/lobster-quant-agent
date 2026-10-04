@@ -15,7 +15,7 @@ import shlex
 import stat
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -492,9 +492,10 @@ def format_monitor_status_summary(status):
         f"- 是否只在交易时段运行：{'是' if monitor.get('market_hours_only') else '否'}",
         f"- 当前交易状态：{trading.get('message') or '-'}",
         (
-            f"- 预计恢复扫描：{trading.get('next_open')}（按工作日规则）"
+            f"- 预计恢复扫描：{trading.get('next_open')}（按已收录交易所日历，临时停市须另行核实）"
             if not trading.get("is_trading_time") and trading.get("next_open")
-            else "- 预计恢复扫描：当前已在交易时段"
+            else "- 预计恢复扫描：当前已在交易时段" if trading.get("is_trading_time")
+            else "- 预计恢复扫描：未知，需更新交易所日历后再核实"
         ),
         "",
         "二、盯盘模式",
@@ -5191,7 +5192,6 @@ def build_strategy_alerts_once():
         return {"ok": True, "monitor_enabled": False, "mode": monitor.get("mode"), "alerts": [], "alerts_count": 0}
     t_status = trading_time_status()
     if monitor.get("market_hours_only", True) and not t_status.get("is_trading_time"):
-        next_open = t_status.get("next_open")
         return {
             "ok": True,
             "monitor_enabled": True,
@@ -5203,11 +5203,7 @@ def build_strategy_alerts_once():
             "message": (
                 f"{t_status.get('message', '当前不在A股交易时间。')}"
                 "策略盯盘当前不扫描行情、不触发提醒；"
-                + (
-                    f"按工作日规则将在 {next_open} 后恢复扫描。"
-                    if next_open else
-                    "将在下一个交易时段恢复扫描。"
-                )
+                + _monitor_resume_message(t_status)
             )
         }
     if not rules:
@@ -5443,61 +5439,103 @@ def _get_monitor_profile(cfg):
 
 
 
+# Published full-year SSE/SZSE schedules; this does not infer future calendars
+# from weekdays or government make-up workdays, or cover unscheduled closures.
+_A_SHARE_CALENDARS = {
+    2026: {
+        "holidays": (
+            ("2026-01-01", "2026-01-03", "元旦"),
+            ("2026-02-15", "2026-02-23", "春节"),
+            ("2026-04-04", "2026-04-06", "清明节"),
+            ("2026-05-01", "2026-05-05", "劳动节"),
+            ("2026-06-19", "2026-06-21", "端午节"),
+            ("2026-09-25", "2026-09-27", "中秋节"),
+            ("2026-10-01", "2026-10-07", "国庆节"),
+        ),
+        "sources": (
+            "https://www.sse.com.cn/disclosure/announcement/general/c/c_20251222_10802507.shtml",
+            "https://www.szse.cn/disclosure/notice/t20251222_618087.html",
+        ),
+    },
+}
+
+
+def _market_calendar_now(now=None):
+    now = now if now is not None else _market_now()
+    if now.tzinfo is not None:
+        now = now.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    return now
+
+
+def _a_share_calendar_day(now):
+    calendar = _A_SHARE_CALENDARS.get(now.year)
+    if calendar is None:
+        return {"verified": False, "is_trading_day": None, "holiday": None}
+    date_text = now.date().isoformat()
+    holiday = next((name for start, end, name in calendar["holidays"] if start <= date_text <= end), None)
+    return {
+        "verified": True,
+        "is_trading_day": now.weekday() < 5 and holiday is None,
+        "holiday": holiday,
+    }
+
+
 def _next_weekday_open(now):
-    morning_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    afternoon_open = now.replace(hour=13, minute=0, second=0, microsecond=0)
-    if now.weekday() < 5:
-        if now < morning_open:
-            return morning_open
-        if now < afternoon_open and now.hour * 60 + now.minute > 11 * 60 + 30:
-            return afternoon_open
-    candidate = morning_open
-    candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
+    """Next session start in a verified calendar; historical function name kept."""
+    now = _market_calendar_now(now)
+    candidate = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    while candidate.year in _A_SHARE_CALENDARS:
+        if _a_share_calendar_day(candidate)["is_trading_day"]:
+            for hour, minute in ((9, 30), (13, 0)):
+                opening = candidate.replace(hour=hour, minute=minute)
+                if opening > now:
+                    return opening
         candidate += timedelta(days=1)
-    return candidate
+    return None
 
 
 def is_a_share_trading_time(now=None):
-    """
-    A股连续竞价交易时间判断：
-    周一至周五 09:30-11:30、13:00-15:00。
-    暂不判断法定节假日。
-    """
-    now = now or _market_now()
-
-    if now.weekday() >= 5:
+    """Verified A-share monitoring hours, including the closing auction."""
+    now = _market_calendar_now(now)
+    if not _a_share_calendar_day(now)["is_trading_day"]:
         return False
-
-    hm = now.hour * 60 + now.minute
-    morning_start = 9 * 60 + 30
-    morning_end = 11 * 60 + 30
-    afternoon_start = 13 * 60
-    afternoon_end = 15 * 60
-
-    return (morning_start <= hm <= morning_end) or (afternoon_start <= hm <= afternoon_end)
+    clock = now.time()
+    return (datetime_time(9, 30) <= clock <= datetime_time(11, 30)) or (
+        datetime_time(13) <= clock <= datetime_time(15)
+    )
 
 
 def trading_time_status(now=None):
-    now = now or _market_now()
+    now = _market_calendar_now(now)
     weekday_names = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
     weekday_name = weekday_names[now.weekday()]
-    hm = now.hour * 60 + now.minute
-    is_trading_day = now.weekday() < 5
+    clock = now.time()
+    calendar_day = _a_share_calendar_day(now)
+    is_trading_day = calendar_day["is_trading_day"]
     is_trading_time = is_a_share_trading_time(now)
 
-    if not is_trading_day:
+    if not calendar_day["verified"]:
+        session = "calendar_unverified"
+        message = f"尚未收录{now.year}年交易所休市日历，无法确认交易日；默认暂停时段内盯盘，请更新日历。"
+    elif not is_trading_day:
         session = "non_trading_day"
-        message = f"今天是{weekday_name}，属于非交易日。"
-    elif hm < 9 * 60 + 30:
+        message = (
+            f"今天是{calendar_day['holiday']}公告休市日。"
+            if calendar_day["holiday"] else
+            f"今天是{weekday_name}，属于周末休市日。"
+        )
+    elif clock < datetime_time(9, 30):
         session = "pre_open"
-        message = "今天是交易日，当前尚未开盘。"
-    elif 11 * 60 + 30 < hm < 13 * 60:
+        message = "今天按已收录日历为交易日，当前尚未到09:30盯盘开始时间。"
+    elif datetime_time(11, 30) < clock < datetime_time(13):
         session = "lunch_break"
         message = "今天是交易日，当前处于午间休市。"
-    elif hm > 15 * 60:
+    elif clock > datetime_time(15):
         session = "after_close"
         message = "今天是交易日，当前已经收盘。"
+    elif clock >= datetime_time(14, 57):
+        session = "closing_auction"
+        message = "当前处于A股收盘集合竞价时段，盯盘继续运行。"
     else:
         session = "trading"
         message = "当前处于A股连续竞价交易时段。"
@@ -5508,11 +5546,24 @@ def trading_time_status(now=None):
         "weekday": weekday_name,
         "is_trading_day": is_trading_day,
         "is_trading_time": is_trading_time,
+        "is_continuous_auction": is_trading_time and session == "trading",
         "session": session,
         "message": message,
         "next_open": next_open.strftime("%Y-%m-%d %H:%M:%S") if next_open else None,
-        "rule": "A股交易时间：周一至周五 09:30-11:30、13:00-15:00；暂不判断法定节假日。"
+        "calendar_verified": calendar_day["verified"],
+        "calendar_status": "verified" if calendar_day["verified"] else "unverified_year",
+        "calendar_years": sorted(_A_SHARE_CALENDARS),
+        "calendar_sources": list(_A_SHARE_CALENDARS.get(now.year, {}).get("sources", ())),
+        "timezone": "Asia/Shanghai",
+        "rule": "A股盯盘：已收录日历的交易日09:30:00–11:30:00、13:00:00–15:00:00（含截止时点）；14:57起为收盘集合竞价。未收录年份暂停时段内盯盘；临时停市和个股停牌须另行核实。",
     }
+
+
+def _monitor_resume_message(trading_status):
+    next_open = trading_status.get("next_open")
+    if next_open:
+        return f"按已收录交易所日历预计在 {next_open} 恢复扫描；临时停市须另行核实。"
+    return "尚无法确认下一个开盘时间，需更新交易所日历后再核实。"
 
 
 def _monitor_start_message(label, start_result, verify_result, trading_status):
@@ -5525,15 +5576,9 @@ def _monitor_start_message(label, start_result, verify_result, trading_status):
         return prefix + "当前处于交易时段，将按已保存策略扫描并触发提醒。"
 
     detail = trading_status.get("message", "当前不在A股交易时间。")
-    next_open = trading_status.get("next_open")
-    resume = (
-        f"按工作日规则将在 {next_open} 后恢复扫描"
-        if next_open else
-        "将在下一个交易时段恢复扫描"
-    )
     return (
         f"{prefix}{detail}当前不会扫描行情或触发提醒，后台进程保持等待；"
-        f"{resume}。法定节假日暂未纳入日历判断。"
+        + _monitor_resume_message(trading_status)
     )
 
 
@@ -5564,7 +5609,6 @@ def build_monitor_alerts_once():
         }
 
     if market_hours_only and not t_status.get("is_trading_time"):
-        next_open = t_status.get("next_open")
         return {
             "ok": True,
             "monitor_enabled": True,
@@ -5578,11 +5622,7 @@ def build_monitor_alerts_once():
             "message": (
                 f"{t_status.get('message', '当前不在A股交易时间。')}"
                 "已跳过实时盯盘提醒，不会根据收盘或非实时行情触发 alerts；"
-                + (
-                    f"按工作日规则将在 {next_open} 后恢复扫描。"
-                    if next_open else
-                    "将在下一个交易时段恢复扫描。"
-                )
+                + _monitor_resume_message(t_status)
             )
         }
 
@@ -6029,6 +6069,7 @@ def _format_monitor_diagnose(result):
         f"- 后台进程：{'运行中' if process.get('running') else '未运行'}",
         f"- PID：{process.get('pid') if process.get('running') else '无'}",
         f"- 当前是否交易时间：{'是' if trading.get('is_trading_time') else '否'}",
+        f"- 交易日历状态：{trading.get('message') or '未知'}",
         f"- last_scan_at：{result.get('last_scan_at') or '-'}",
         f"- last_quote_at：{result.get('last_quote_at') or '-'}",
         "",
@@ -6091,8 +6132,13 @@ def monitor_diagnose(raw_json=False):
 
     conclusion = "普通盯盘未开启。"
     if monitor.get("enabled"):
-        if not (status.get("trading_time") or {}).get("is_trading_time"):
-            conclusion = "当前不在交易时间，后台若运行也只等待，不扫描实时行情。"
+        trading = status.get("trading_time") or {}
+        if not trading.get("is_trading_time"):
+            conclusion = (
+                (trading.get("message") or "当前不在已确认的交易时间。")
+                + "后台若运行也只等待，不扫描实时行情。"
+                + _monitor_resume_message(trading)
+            )
         elif scan_result and scan_result.get("alerts_count"):
             conclusion = "本次诊断发现候选提醒，真实后台会按 notify_channels 推送。"
         elif scan_result:

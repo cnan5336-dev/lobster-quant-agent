@@ -9,6 +9,7 @@ All notable changes are recorded here. Versions follow Semantic Versioning.
 - Preserve every supported strategy condition, comparison, direction, timeframe and explicit symbol; reject ambiguous combinations instead of silently changing their meaning. Return a readable execution preview and keep the previous strategy when parsing fails.
 - Fetch only the data required by each strategy, share a bounded worker pool, cache daily history briefly, and report per-source timing. Reject stale or invalid data before evaluating signals.
 - Commit alert activation only after delivery, preserve activation across unavailable data, and restore enabled monitoring through the verified process lifecycle.
+- Apply the published 2026 exchange holiday calendar and exact session cutoffs to default monitoring. Label the closing auction correctly, pause on unverified calendar years, and keep status, diagnosis and next-open guidance consistent.
 - Keep report dates, scope, source evidence and missing-data warnings consistent. Do not present live quotes as historical reports or count duplicate leaderboard rows as additional money flows.
 - Validate backtest bars and conditions, normalize volume units, calculate requested moving-average windows, disclose conservative execution assumptions and retain the previous saved strategy when a run fails.
 - Use a verified previous-session close for US daily price changes rather than a five-day chart reference.

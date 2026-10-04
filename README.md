@@ -103,6 +103,10 @@ python3 scripts/first_use_smoke.py
 
 已配置本机 DeepSeek 与 CLIProxyAPI 的用户可显式初始化[Codex 流量开关](docs/model-traffic-switch.md)，使用 `model codex on|off|status` 控制后续模型请求。安装项目本身不会启用它；未初始化时继续使用原有配置。`model` 不带参数只查询状态，不调用模型。
 
+默认盯盘按上海时区及已收录的交易所日历运行，当前覆盖 **2026 年**（[上交所休市公告](https://www.sse.com.cn/disclosure/announcement/general/c/c_20251222_10802507.shtml)、[深交所休市公告](https://www.szse.cn/disclosure/notice/t20251222_618087.html)）；补班周末仍休市。盯盘窗口为 09:30:00–11:30:00、13:00:00–15:00:00，包含截止时点，下一微秒即暂停；14:57 起显示为收盘集合竞价，继续监控。开盘集合竞价不在盯盘窗口内。
+
+未收录年份会返回 `calendar_status: "unverified_year"`、`is_trading_day: null`，默认暂停扫描；不能仅按星期推算恢复时间。跨出日历覆盖范围时 `next_open` 也为 `null`，需依据新年度交易所公告更新 `_A_SHARE_CALENDARS` 并验证休市、恢复及年末边界。日历仅涵盖已公告常规安排，临时停市、个股停牌和实时数据新鲜度须另行核实；将 `market_hours_only` 设为 `false` 会显式绕过时段门禁，不应用于宣称盘中验收通过。
+
 ## English overview
 
 Lobster Quant Agent puts quote lookup, research reports, conditional alerts, natural-language strategy monitoring, and historical backtesting behind one OpenClaw tool: `lobster_quant`.
