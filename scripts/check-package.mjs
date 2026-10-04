@@ -57,6 +57,7 @@ const forbidden = [
   /(?:^|\/)(?:\.?client[-_]key|proxy[-_]client|auth[-_]profiles?|sessions?|request[-_]history|model[-_]traffic[-_]policy|cliproxy[-_]switch[-_]policy|\.?cliproxy[-_]switch[-_]installed)(?:[._-][^/]*)?(?:\/|$)/i,
   /(?:^|\/)(?:openclaw\.(?:json5?|ya?ml)|auth\.(?:json5?|ya?ml)|hosts\.yml)(?:[._-][^/]*)?$/i,
   /(?:^|\/)(?:market_watchlist|market_monitor_state|backtest_config|openclaw-workspace-state)\.json$/i,
+  /(?:^|\/)(?:market_monitor_state\.json|[^/]+\.delivery\.json|[^/]+\.initialized|\.monitor-state-[^/]+\.tmp)(?:[._-][^/]*)?(?:\/|$)/i,
   /\.(?:log|jsonl|har|db|sqlite3?|pid|session|lock|pem|key|p12|pickle)(?:[._-][^/]*)?$/i,
 ];
 

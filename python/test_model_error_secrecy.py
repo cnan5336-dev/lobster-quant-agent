@@ -205,7 +205,8 @@ class ModelErrorSecrecyTests(unittest.TestCase):
             self.assertIn("格式无效", result["error"])
 
     def test_successful_json_response_exports_confirmation_only(self):
-        payload = {"ok": True, "apiKey": SENTINEL, "message": SENTINEL,
+        payload = {"action": "send", "channel": "telegram", "dryRun": False,
+                   "handledBy": "core", "apiKey": SENTINEL, "message": SENTINEL,
                    "raw": SENTINEL, "payload": {"ok": True, "messageId": SENTINEL}}
         result = self.notification(response=SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=SENTINEL))
         self.assertTrue(result["ok"])
@@ -215,7 +216,9 @@ class ModelErrorSecrecyTests(unittest.TestCase):
         for payload in ({"ok": False, "message": SENTINEL}, {"success": False, "raw": SENTINEL},
                         {"error": SENTINEL}, {"payload": {"error": SENTINEL}},
                         {"payload": {"ok": False, "message": SENTINEL}}):
-            result = self.notification(response=SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""))
+            envelope = {"action": "send", "channel": "telegram", "dryRun": False,
+                        "handledBy": "core", "payload": payload}
+            result = self.notification(response=SimpleNamespace(returncode=0, stdout=json.dumps(envelope), stderr=""))
             self.assertFalse(result["ok"])
             self.assertNotIn("response", result)
 

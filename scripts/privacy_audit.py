@@ -36,6 +36,9 @@ PRIVATE_BASENAME = re.compile(
     r"request[-_]history|model[-_]traffic[-_]policy|cliproxy[-_]switch[-_]policy|"
     r"\.?cliproxy[-_]switch[-_]installed)(?:[._-].*)?$"
 )
+RUNTIME_STATE_BASENAME = re.compile(
+    r"(?i)^(?:market_monitor_state\.json|.+\.delivery\.json|.+\.initialized|\.monitor-state-.+\.tmp)(?:[._-].*)?$"
+)
 CREDENTIAL_NAME = (
     r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|bot[_-]?token|"
     r"auth[_-]?token|client[_-]?secret|password|token|secret)"
@@ -134,12 +137,14 @@ def audit(root: Path) -> list[str]:
         relative = path.relative_to(root)
         lowered_parts = {part.lower() for part in relative.parts[:-1]}
         name = path.name.lower()
-        if (name in FORBIDDEN_NAMES or PRIVATE_BASENAME.fullmatch(name)
+        if (name in FORBIDDEN_NAMES or PRIVATE_BASENAME.fullmatch(name) or RUNTIME_STATE_BASENAME.fullmatch(name)
                 or name == ".env" or (name.startswith(".env.") and name != ".env.example")):
             findings.append(f"forbidden private filename: {relative}")
         if path.suffix.lower() in FORBIDDEN_SUFFIXES:
             findings.append(f"forbidden private file type: {relative}")
-        if lowered_parts & FORBIDDEN_PARTS or any(PRIVATE_BASENAME.fullmatch(part) for part in lowered_parts):
+        if lowered_parts & FORBIDDEN_PARTS or any(
+            PRIVATE_BASENAME.fullmatch(part) or RUNTIME_STATE_BASENAME.fullmatch(part) for part in lowered_parts
+        ):
             findings.append(f"forbidden runtime-state directory: {relative}")
         if path.is_symlink():
             findings.append(f"symlink is not scanned: {relative}")

@@ -29,7 +29,11 @@ model-traffic-policy*
 cliproxy-switch-policy*
 .cliproxy-switch-installed*
 market_watchlist.json
-market_monitor_state.json
+market_monitor_state.json*
+*.delivery.json*
+*.initialized
+*.initialized.*
+.monitor-state-*.tmp
 backtest_config.json
 openclaw-workspace-state.json
 .openclaw/

@@ -107,6 +107,33 @@ python3 scripts/first_use_smoke.py
 
 未收录年份会返回 `calendar_status: "unverified_year"`、`is_trading_day: null`，默认暂停扫描；不能仅按星期推算恢复时间。跨出日历覆盖范围时 `next_open` 也为 `null`，需依据新年度交易所公告更新 `_A_SHARE_CALENDARS` 并验证休市、恢复及年末边界。日历仅涵盖已公告常规安排，临时停市、个股停牌和实时数据新鲜度须另行核实；将 `market_hours_only` 设为 `false` 会显式绕过时段门禁，不应用于宣称盘中验收通过。
 
+### 通知渠道与送达恢复
+
+`notify_channels` 是明确的发送范围：`["telegram"]` 只发 Telegram，`[]` 表示不发送，不会补上微信、QQ、旧 `notify_channel` 或环境默认值。只有复数键缺失时才读取旧单渠道键；两个键都缺失时，才允许使用显式配置的 `LOBSTER_QUANT_NOTIFY_CHANNELS`。未知渠道或无效列表会在发送前整组拒绝。
+
+不带 `--channel` 的启动命令保留现有范围；`monitor on --channel telegram` 只选择 Telegram。新安装默认关闭盯盘且没有通知渠道，范围为空时启动会明确失败。普通 `monitor notify-test` / `monitor simulate-alert` 使用现有配置；显式指定渠道才测试该渠道。这两条命令会发送测试消息，必须由用户主动请求。
+
+提醒发送前会写入本地送达记录，再记录各渠道的确认结果。超时、确认不明或发送期间崩溃可能留下 `unknown` / `inflight`；此时通知进入 `hold`，重启也不会自动重发，测试通知同样暂停。查看当前事务后再作人工判断：
+
+```text
+monitor delivery status
+monitor delivery resolve ID CHANNEL delivered
+monitor delivery resolve ID CHANNEL not-delivered
+monitor delivery resolve ID CHANNEL abandon
+```
+
+`ID` 和 `CHANNEL` 必须来自当前状态，后三条是互斥的处理选择：
+
+| 选择 | 含义与后续行为 |
+| --- | --- |
+| `delivered` | 用户确认该渠道已收到；记录确认并提交本批冷却。 |
+| `not-delivered` | 用户确认未收到；全部渠道都未送达或跳过时，允许后续新鲜行情重新评估。已有其他渠道成功时，不重发成功渠道，也不补发失败渠道。 |
+| `abandon` | 放弃并消费本次候选，提交冷却及相应策略激活状态；不把它记成已送达。 |
+
+三个恢复动作本身都不发送消息，也不重放旧正文；剩余未知渠道仍会保持 `hold`。不得仅因日志出现 `hold` 就自动选择恢复动作。网络确认与本地写盘无法原子完成，因此不能保证 exactly-once：误判为未送达可能使后续新信号重复提醒，放弃则可能漏掉本次提醒。
+
+状态、送达记录或盯盘配置损坏时保留原文件并明确失败，不自动重建、清空冷却或删除记录。先保存现场并核实状态；不要用删除文件或重启来解除未知送达状态。更多验证范围见[可靠性记录](docs/validation/2026-10-03-reliability.md)。
+
 ## English overview
 
 Lobster Quant Agent puts quote lookup, research reports, conditional alerts, natural-language strategy monitoring, and historical backtesting behind one OpenClaw tool: `lobster_quant`.
@@ -190,7 +217,7 @@ Maintainers should also follow [MAINTAINERS.md](MAINTAINERS.md) and the [local C
 - 龙虎榜 and some breadth/news workflows depend on AkShare and its upstream sources.
 - Minute history can be shorter than requested. Cache fallback is labeled and may be stale.
 - Backtests are simplified simulations; they do not fully model liquidity, price limits, corporate actions, or real execution.
-- Monitoring is local and opt-in. Notification delivery fails closed when a channel target is missing.
+- Monitoring is local and opt-in. Explicit channel lists are never expanded; an empty list or missing target prevents delivery. A durable journal holds uncertain outcomes for manual resolution; it does not guarantee exactly-once delivery.
 - The monitor uses POSIX file locks, so Windows is not supported in this release.
 - Never commit local OpenClaw configuration, credentials, channel/account identifiers, notification targets, watchlists, holdings, state, caches, logs, screenshots, or generated results.
 

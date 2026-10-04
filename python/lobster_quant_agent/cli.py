@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import tempfile
 import os
 import io
 import contextlib
@@ -72,6 +73,46 @@ def _state_path(*parts):
 WATCHLIST_PATH = _state_path("market_watchlist.json")
 
 
+def _validated_notify_channel(channel):
+    if not isinstance(channel, str) or not channel.strip():
+        raise ValueError("notification_channel_invalid")
+    value = _normalize_channel_name(channel)
+    if value not in {"weixin", "telegram", "qq"}:
+        raise ValueError("notification_channel_invalid")
+    return value
+
+
+def _notification_scope_error(code):
+    messages = {
+        "no_notification_channels": "未配置通知渠道；本次未发送。",
+        "notification_channel_invalid": "通知渠道无效或当前运行方式不支持；本次未发送。",
+        "notification_config_unavailable": "无法读取有效的通知配置；本次未发送。",
+    }
+    return {"ok": False, "skipped": True, "error": code, "error_code": code,
+            "message": messages[code], "notify_channels": [], "results": [],
+            "successful_channels": [], "failed_channels": []}
+
+
+def _notification_channel_scope(channels=None):
+    if channels is None:
+        try:
+            cfg = load_watchlist_config()
+            monitor = cfg.get("monitor")
+            if not isinstance(monitor, dict):
+                raise ValueError("notification_config_unavailable")
+        except Exception:
+            return _notification_scope_error("notification_config_unavailable")
+    else:
+        monitor = {"notify_channels": channels}
+    try:
+        normalized = _normalize_notify_channels(monitor)
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
+    if not normalized:
+        return _notification_scope_error("no_notification_channels")
+    return {"ok": True, "notify_channels": normalized}
+
+
 def _normalize_channel_name(channel):
     value = str(channel or "").strip().lower()
     if value in {"weixin", "wechat", "微信", "openclaw-weixin"}:
@@ -88,32 +129,35 @@ def _default_output_channel():
 
 
 def _normalize_notify_channels(monitor, include_fallback=True):
-    raw = []
+    # Presence matters: an explicit empty list is an instruction not to send.
+    missing = False
     if isinstance(monitor, dict):
-        configured = monitor.get("notify_channels")
-        if isinstance(configured, list):
-            raw.extend(configured)
-        elif configured:
-            raw.append(configured)
-        legacy = monitor.get("notify_channel")
-        if legacy:
-            raw.append(legacy)
-    elif monitor:
-        raw.append(monitor)
-
+        if "notify_channels" in monitor:
+            raw = monitor["notify_channels"]
+        elif "notify_channel" in monitor:
+            raw = monitor["notify_channel"]
+            if raw == "":
+                raw = []
+        else:
+            missing = True
+            raw = []
+    elif monitor is None:
+        missing = True
+        raw = []
+    else:
+        raw = monitor
+    if missing and include_fallback:
+        configured = os.environ.get("LOBSTER_QUANT_NOTIFY_CHANNELS", "")
+        raw = configured.split(",") if configured.strip() else []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("notification_channel_invalid")
     normalized = []
     for item in raw:
-        channel = _normalize_channel_name(item)
-        if channel and channel not in normalized:
+        channel = _validated_notify_channel(item)
+        if channel not in normalized:
             normalized.append(channel)
-
-    if not normalized and include_fallback:
-        configured = os.environ.get("LOBSTER_QUANT_NOTIFY_CHANNELS", "")
-        normalized = [
-            _normalize_channel_name(item)
-            for item in configured.split(",")
-            if item.strip()
-        ]
     return normalized
 
 
@@ -199,6 +243,7 @@ def _default_watchlist_config():
 def _normalize_monitor_config(cfg):
     defaults = _default_watchlist_config()
     monitor = cfg.setdefault("monitor", {})
+    channels = _normalize_notify_channels(monitor)
     old_mode = str(monitor.get("mode", "normal"))
     if old_mode in {"low", "medium", "high"}:
         old_mode = "normal"
@@ -217,7 +262,6 @@ def _normalize_monitor_config(cfg):
     monitor.setdefault("enabled", False)
     monitor.setdefault("market_hours_only", True)
     monitor.setdefault("source_channel", os.environ.get("LOBSTER_QUANT_CHANNEL", "telegram"))
-    channels = _normalize_notify_channels(monitor)
     monitor["notify_channels"] = channels
     monitor["notify_channel"] = channels[0] if channels else ""
     monitor.setdefault("last_notify_result", None)
@@ -242,14 +286,15 @@ def load_watchlist_config():
         with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception:
-        cfg = _default_watchlist_config()
-
+        raise ValueError("盯盘配置无效或不可读取；请修复配置后重试。") from None
+    if not isinstance(cfg, dict) or ("monitor" in cfg and not isinstance(cfg["monitor"], dict)):
+        raise ValueError("盯盘配置格式无效；请修复配置后重试。")
     default = _default_watchlist_config()
-    for k, v in default.items():
-        if k not in cfg:
-            cfg[k] = v
-    if "enabled" not in cfg.get("monitor", {}):
-        cfg["monitor"] = default["monitor"]
+    for key, value in default.items():
+        if key not in cfg:
+            cfg[key] = value
+    # Missing enabled must not discard an existing explicit notification scope.
+    cfg["monitor"].setdefault("enabled", False)
     return _normalize_monitor_config(cfg)
 
 
@@ -338,7 +383,24 @@ def watchlist_list(pool=None):
 
 
 def monitor_set(enabled, mode=None, source_channel=None, notify_channels=None):
-    cfg = load_watchlist_config()
+    try:
+        requested = (_normalize_notify_channels({"notify_channels": notify_channels}, include_fallback=False)
+                     if notify_channels is not None else None)
+        source = _validated_notify_channel(source_channel) if source_channel is not None else None
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
+    if bool(enabled) and requested == []:
+        return _notification_scope_error("no_notification_channels")
+    try:
+        cfg = load_watchlist_config()
+    except Exception:
+        return _notification_scope_error("notification_config_unavailable")
+    try:
+        channels = requested if requested is not None else _normalize_notify_channels(cfg.get("monitor", {}))
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
+    if bool(enabled) and not channels:
+        return _notification_scope_error("no_notification_channels")
     cfg.setdefault("monitor", _default_watchlist_config()["monitor"])
     profiles = _default_monitor_profiles()
 
@@ -369,17 +431,12 @@ def monitor_set(enabled, mode=None, source_channel=None, notify_channels=None):
     cfg["monitor"]["targets"] = profile.get("targets", ["holding_pool", "watch_pool"])
     cfg["monitor"]["cooldown_minutes"] = profile.get("cooldown_minutes", 60)
     cfg["monitor"]["use_llm"] = bool(profile.get("use_llm", False))
-    if source_channel:
-        cfg["monitor"]["source_channel"] = _normalize_channel_name(source_channel)
+    if source is not None:
+        cfg["monitor"]["source_channel"] = source
     else:
         cfg["monitor"].setdefault(
             "source_channel", os.environ.get("LOBSTER_QUANT_CHANNEL", "telegram")
         )
-    channels = _normalize_notify_channels(
-        {"notify_channels": notify_channels}
-        if notify_channels is not None else
-        cfg["monitor"]
-    )
     cfg["monitor"]["notify_channels"] = channels
     cfg["monitor"]["notify_channel"] = channels[0] if channels else ""
 
@@ -392,16 +449,28 @@ def monitor_set(enabled, mode=None, source_channel=None, notify_channels=None):
 
 
 def monitor_status():
-    cfg = load_watchlist_config()
+    try:
+        cfg = load_watchlist_config()
+    except Exception:
+        return {"ok": False, "blocked": True, "monitor": {},
+                "state_health": {"ok": False, "blocked": True, "code": "notification_config_unavailable",
+                                 "message": "盯盘配置不可用，请保留原文件并检查配置。"},
+                "trading_time": trading_time_status()}
+    state_health = {"ok": True, "blocked": False}
     strategy = cfg.get("strategy_monitor", {}) or {}
     try:
         runtime_state = load_monitor_state()
         runtime_unavailable = runtime_state.get("strategy_last_unavailable", [])
-    except Exception:
-        runtime_state = {}
-        runtime_unavailable = []
+    except MonitorStateBlocked as exc:
+        runtime_state, runtime_unavailable = {}, []
+        state_health = exc.as_status()
+    delivery = monitor_delivery_status()
+    blocked = bool(state_health.get("blocked") or delivery.get("blocked"))
     return {
-        "ok": True,
+        "ok": not blocked,
+        "blocked": blocked,
+        "state_health": state_health,
+        "delivery": delivery,
         "monitor": cfg.get("monitor", _default_watchlist_config()["monitor"]),
         "trading_time": trading_time_status(),
         "watch_pool_count": len(cfg.get("watch_pool", [])),
@@ -420,6 +489,7 @@ def monitor_status():
             "runtime_unavailable": runtime_unavailable
         }
     }
+
 
 
 def _monitor_status_with_runtime():
@@ -466,7 +536,10 @@ def format_monitor_status_summary(status):
     targets = monitor.get("targets") or []
     target_text = "、".join(_monitor_target_name(item) for item in targets) or "无"
     source_channel = _normalize_channel_name(monitor.get("source_channel"))
-    notify_channels = _normalize_notify_channels(monitor)
+    try:
+        notify_channels = _normalize_notify_channels(monitor, include_fallback=False)
+    except ValueError:
+        notify_channels = []
     channel_display = {
         "weixin": "微信",
         "telegram": "Telegram",
@@ -525,7 +598,11 @@ def format_monitor_status_summary(status):
         ),
         "- 以上后台进程状态来自 PID、进程身份和运行锁的联合检查。",
     ]
+    warnings = _monitor_health_lines(status)
+    if warnings:
+        lines[1:1] = ["", *warnings, ""]
     return "\n".join(lines)
+
 
 
 def monitor_status_output(text=""):
@@ -3629,11 +3706,13 @@ def handle_natural_language_command(text):
     }:
         return monitor_diagnose()
 
-    if text in {"测试盯盘提醒", "微信通知测试", "测试微信盯盘提醒"}:
+    if text in {"微信通知测试", "测试微信盯盘提醒"}:
         return monitor_notify_test("weixin")
+    if text == "测试盯盘提醒":
+        return monitor_notify_test()
 
     if text in {"模拟盯盘提醒", "模拟触发普通盯盘", "测试普通盯盘模拟提醒"}:
-        return monitor_simulate_alert("weixin")
+        return monitor_simulate_alert()
 
     simulate_match = re.search(
         r"(?:模拟触发策略盯盘|策略盯盘模拟验证)\s*([036]\d{5})?",
@@ -3643,12 +3722,9 @@ def handle_natural_language_command(text):
         return strategy_simulate(simulate_match.group(1) or "510050")
 
     if text in {"启动策略盯盘", "开启策略盯盘", "执行策略盯盘", "运行策略盯盘"}:
-        set_result = monitor_set(
-            True,
-            mode="strategy",
-            source_channel=_default_output_channel(),
-            notify_channels=_normalize_notify_channels({}, include_fallback=True),
-        )
+        set_result = monitor_set(True, mode="strategy")
+        if not set_result.get("ok"):
+            return set_result
         start_result = monitor_start()
         verify_result = monitor_verify(expected_running=True, wait_seconds=1.2)
         trading_status = trading_time_status()
@@ -3682,12 +3758,9 @@ def handle_natural_language_command(text):
         "启动省流盯盘", "启动标准盯盘", "启动严密盯盘"
     }
     if text.lower() in normal_monitor_commands or text in normal_monitor_commands:
-        set_result = monitor_set(
-            True,
-            mode="normal",
-            source_channel=_default_output_channel(),
-            notify_channels=_normalize_notify_channels({}, include_fallback=True),
-        )
+        set_result = monitor_set(True, mode="normal")
+        if not set_result.get("ok"):
+            return set_result
         start_result = monitor_start()
         verify_result = monitor_verify(expected_running=True, wait_seconds=1.2)
         return {
@@ -3699,12 +3772,9 @@ def handle_natural_language_command(text):
         }
 
     if text in {"启动盯盘", "启动后台盯盘", "开始后台盯盘"}:
-        monitor_set(
-            True,
-            mode="normal",
-            source_channel=_default_output_channel(),
-            notify_channels=_normalize_notify_channels({}, include_fallback=True),
-        )
+        set_result = monitor_set(True, mode="normal")
+        if not set_result.get("ok"):
+            return set_result
         start_result = monitor_start()
         verify_result = monitor_verify(expected_running=True, wait_seconds=1.2)
         return {"ok": bool(verify_result.get("verified")), "action": "start_monitor_current_mode", "start": start_result, "verify": verify_result}
@@ -3982,6 +4052,751 @@ MONITOR_STATE_LOCK_PATH = _state_path("market_monitor_state.lock")
 STRATEGY_SELFCHECK_STATE_PATH = _state_path("strategy_selfcheck_state.json")
 
 
+
+_MONITOR_STATE_MAX_BYTES = 4 * 1024 * 1024
+_MONITOR_STATE_MARKER = b'monitor-state-initialized-v1\n'
+_MONITOR_STATE_OBSERVED_PATHS = set()
+_MONITOR_STATE_SYNCED_MARKERS = {}
+
+class MonitorStateBlocked(RuntimeError):
+    """A safe, fixed diagnostic: never include file contents or OS error text."""
+    def __init__(self, code):
+        self.code = code
+        super().__init__('盯盘状态不可用，已停止扫描及发送；保留原文件，需检查或恢复状态。')
+
+    def as_status(self):
+        return {'ok': False, 'blocked': True, 'code': self.code,
+                'message': str(self), 'recovery_required': True}
+
+
+def _monitor_state_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _monitor_state_lstat(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise MonitorStateBlocked('state_access_failed') from None
+
+
+def _monitor_state_check_file(info):
+    if not stat.S_ISREG(info.st_mode):
+        raise MonitorStateBlocked('state_not_regular')
+    if info.st_uid != os.getuid() or info.st_nlink != 1:
+        raise MonitorStateBlocked('state_ownership_invalid')
+    if info.st_mode & 0o022:
+        raise MonitorStateBlocked('state_permissions_unsafe')
+
+
+def _monitor_state_read_bytes(path, limit):
+    before = _monitor_state_lstat(path)
+    if before is None:
+        return None, None
+    _monitor_state_check_file(before)
+    if before.st_size > limit:
+        raise MonitorStateBlocked('state_too_large')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, 'rb') as handle:
+            opened = os.fstat(handle.fileno())
+            _monitor_state_check_file(opened)
+            if _monitor_state_identity(before) != _monitor_state_identity(opened):
+                raise MonitorStateBlocked('state_changed_during_read')
+            raw = handle.read(limit + 1)
+            after = os.fstat(handle.fileno())
+        current = _monitor_state_lstat(path)
+        if (len(raw) > limit or current is None or
+                _monitor_state_identity(opened) != _monitor_state_identity(after) or
+                _monitor_state_identity(opened) != _monitor_state_identity(current)):
+            raise MonitorStateBlocked('state_changed_during_read')
+        return raw, current
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        raise MonitorStateBlocked('state_access_failed') from None
+
+
+def _monitor_state_fsync_directory():
+    directory = os.path.dirname(os.path.abspath(MONITOR_STATE_PATH))
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise MonitorStateBlocked('state_directory_sync_failed') from None
+
+
+def _monitor_state_marker_present():
+    raw, _ = _monitor_state_read_bytes(MONITOR_STATE_PATH + '.initialized', 128)
+    if raw is None:
+        return False
+    if raw != _MONITOR_STATE_MARKER:
+        raise MonitorStateBlocked('state_marker_invalid')
+    return True
+
+
+def _monitor_state_ensure_marker():
+    if _monitor_state_marker_present():
+        _monitor_state_confirm_marker_sync()
+        return
+    path = MONITOR_STATE_PATH + '.initialized'
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        if not _monitor_state_marker_present():
+            raise MonitorStateBlocked('state_marker_invalid')
+        _monitor_state_confirm_marker_sync()
+        return
+    except OSError:
+        raise MonitorStateBlocked('state_marker_write_failed') from None
+    try:
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(_MONITOR_STATE_MARKER)
+            handle.flush()
+            os.fsync(handle.fileno())
+            created_identity = _monitor_state_identity(os.fstat(handle.fileno()))
+        _monitor_state_fsync_directory()
+        raw, info = _monitor_state_read_bytes(path, 128)
+        if raw != _MONITOR_STATE_MARKER or info is None or _monitor_state_identity(info) != created_identity:
+            raise MonitorStateBlocked('state_marker_invalid')
+        _MONITOR_STATE_SYNCED_MARKERS[os.path.abspath(path)] = _monitor_state_identity(info)
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        # Keep even an incomplete marker: initialization must not silently retry empty.
+        raise MonitorStateBlocked('state_marker_write_failed') from None
+
+
+def _monitor_state_confirm_marker_sync():
+    path = MONITOR_STATE_PATH + '.initialized'
+    raw, info = _monitor_state_read_bytes(path, 128)
+    if raw != _MONITOR_STATE_MARKER or info is None:
+        raise MonitorStateBlocked('state_marker_invalid')
+    key = os.path.abspath(path)
+    identity = _monitor_state_identity(info)
+    if _MONITOR_STATE_SYNCED_MARKERS.get(key) == identity:
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0))
+        try:
+            if _monitor_state_identity(os.fstat(descriptor)) != identity:
+                raise MonitorStateBlocked('state_marker_invalid')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _monitor_state_fsync_directory()
+        current = _monitor_state_lstat(path)
+        if current is None or _monitor_state_identity(current) != identity:
+            raise MonitorStateBlocked('state_marker_invalid')
+        _MONITOR_STATE_SYNCED_MARKERS[key] = identity
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        raise MonitorStateBlocked('state_marker_sync_failed') from None
+
+
+def _monitor_state_finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return False
+    try:
+        return math.isfinite(float(value)) and float(value) >= 0
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _validate_monitor_state(data):
+    if not isinstance(data, dict):
+        raise MonitorStateBlocked('state_schema_invalid')
+    revision = data.get('revision', 0)
+    if type(revision) is not int or revision < 0:
+        raise MonitorStateBlocked('state_schema_invalid')
+    # Never infer missing deduplication maps from a partially valid JSON file.
+    for key in ('last_alerts', 'last_quotes', 'strategy_active'):
+        if key not in data or not isinstance(data[key], dict):
+            raise MonitorStateBlocked('state_schema_invalid')
+    if any(not isinstance(key, str) or not key or not _monitor_state_finite_number(value)
+           for key, value in data['last_alerts'].items()):
+        raise MonitorStateBlocked('state_schema_invalid')
+    active = data.get('strategy_active', {})
+    if not isinstance(active, dict) or any(not isinstance(key, str) or not key or type(value) is not bool
+                                          for key, value in active.items()):
+        raise MonitorStateBlocked('state_schema_invalid')
+    for key, quote in data['last_quotes'].items():
+        if not isinstance(key, str) or not key or not isinstance(quote, dict):
+            raise MonitorStateBlocked('state_schema_invalid')
+        if 'ts' in quote and not _monitor_state_finite_number(quote['ts']):
+            raise MonitorStateBlocked('state_schema_invalid')
+        for field in ('price', 'pct', 'amplitude_percent', 'volume_ratio', 'turnover_rate_percent'):
+            value = quote.get(field)
+            if value is not None:
+                try:
+                    if isinstance(value, bool) or not isinstance(value, (int, float, str)) or not math.isfinite(float(value)):
+                        raise MonitorStateBlocked('state_schema_invalid')
+                except (ValueError, TypeError, OverflowError):
+                    raise MonitorStateBlocked('state_schema_invalid') from None
+        for field in ('name', 'pool', 'mode', 'data_time', 'time'):
+            if quote.get(field) is not None and not isinstance(quote[field], str):
+                raise MonitorStateBlocked('state_schema_invalid')
+    for key in ('last_checked_symbols', 'last_alert_candidates', 'last_suppressed'):
+        value = data.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+            raise MonitorStateBlocked('state_schema_invalid')
+    unavailable = data.get('strategy_last_unavailable', [])
+    if not isinstance(unavailable, list) or any(not isinstance(item, str) for item in unavailable):
+        raise MonitorStateBlocked('state_schema_invalid')
+    for key in ('last_scan_at', 'last_quote_at', 'updated_at'):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            raise MonitorStateBlocked('state_schema_invalid')
+    notification = data.get('last_notify_result')
+    if notification is not None:
+        if not isinstance(notification, dict):
+            raise MonitorStateBlocked('state_schema_invalid')
+        results = notification.get('results', [])
+        if not isinstance(results, list) or any(not isinstance(item, dict) for item in results):
+            raise MonitorStateBlocked('state_schema_invalid')
+        if 'ok' in notification and type(notification['ok']) is not bool:
+            raise MonitorStateBlocked('state_schema_invalid')
+        if 'partial' in notification and type(notification['partial']) is not bool:
+            raise MonitorStateBlocked('state_schema_invalid')
+        for field in ('successful_channels', 'failed_channels', 'notify_channels'):
+            value = notification.get(field, [])
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise MonitorStateBlocked('state_schema_invalid')
+        for result in results:
+            if ('ok' in result and type(result['ok']) is not bool or
+                    result.get('channel') is not None and not isinstance(result['channel'], str)):
+                raise MonitorStateBlocked('state_schema_invalid')
+    # Reject non-JSON values and all non-finite numbers, including nested diagnostics.
+    try:
+        json.dumps(data, ensure_ascii=False, allow_nan=False)
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        raise MonitorStateBlocked('state_schema_invalid') from None
+    normalized = dict(data)
+    normalized.setdefault('revision', 0)
+    normalized.setdefault('strategy_active', {})
+    for key in ('last_checked_symbols', 'last_alert_candidates', 'last_suppressed'):
+        normalized.setdefault(key, [])
+    return normalized
+
+
+def _monitor_state_object_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise MonitorStateBlocked('state_json_invalid')
+        result[key] = value
+    return result
+
+
+def _monitor_state_snapshot(history_expected=False):
+    marker_present = _monitor_state_marker_present()
+    path_key = os.path.abspath(MONITOR_STATE_PATH)
+    before = _monitor_state_lstat(MONITOR_STATE_PATH)
+    if before is None:
+        anchors = (MONITOR_STATE_PATH + '.delivery.json',
+                   MONITOR_STATE_PATH + '.delivery.json.initialized')
+        if (history_expected or marker_present or path_key in _MONITOR_STATE_OBSERVED_PATHS or
+                any(_monitor_state_lstat(path) is not None for path in anchors)):
+            raise MonitorStateBlocked('state_missing_after_initialization')
+        return _validate_monitor_state(_default_monitor_state()), None
+    _MONITOR_STATE_OBSERVED_PATHS.add(path_key)
+    raw, identity = _monitor_state_read_bytes(MONITOR_STATE_PATH, _MONITOR_STATE_MAX_BYTES)
+    if raw is None:
+        raise MonitorStateBlocked('state_changed_during_read')
+    try:
+        data = json.loads(raw, object_pairs_hook=_monitor_state_object_pairs,
+                          parse_constant=lambda _: (_ for _ in ()).throw(MonitorStateBlocked('state_json_invalid')))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise MonitorStateBlocked('state_json_invalid') from None
+    state = _validate_monitor_state(data)
+    # Valid legacy-state migration only: corrupt bytes are preserved without a marker write.
+    _monitor_state_ensure_marker()
+    return state, identity
+
+
+@contextlib.contextmanager
+def _locked_monitor_state():
+    directory = os.path.dirname(os.path.abspath(MONITOR_STATE_LOCK_PATH))
+    try:
+        os.makedirs(directory, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, 'O_CLOEXEC', 0)
+        descriptor = os.open(MONITOR_STATE_LOCK_PATH, flags, 0o600)
+        with os.fdopen(descriptor, 'a+b') as handle:
+            _monitor_state_check_file(os.fstat(handle.fileno()))
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                current = _monitor_state_lstat(MONITOR_STATE_LOCK_PATH)
+                opened = os.fstat(handle.fileno())
+                if current is None or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise MonitorStateBlocked('state_lock_changed')
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        raise MonitorStateBlocked('state_lock_unavailable') from None
+
+
+
+
+
+
+def _openclaw_message_confirmed(payload, provider_channel):
+    """Accept a send receipt, never infer delivery from successful JSON parsing.
+
+    The installed CLI wraps send results in action/channel/dryRun/handledBy/payload.
+    Nested failure, suppression, dry-run or uncertain status overrides a receipt.
+    This confirms the provider operation, not that a human read the message.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if (payload.get("action") != "send" or payload.get("channel") != provider_channel
+            or payload.get("dryRun") is not False
+            or payload.get("handledBy") not in ("core", "plugin")
+            or not isinstance(payload.get("payload"), dict)):
+        return False
+    pending = [(payload, 0)]
+    confirmed = False
+    visited = 0
+    while pending:
+        item, depth = pending.pop()
+        visited += 1
+        if visited > 256 or depth > 8:
+            return False
+        if (item.get("ok") is False or item.get("success") is False
+                or item.get("error") or item.get("isError") is True
+                or item.get("dryRun") is True or item.get("sentBeforeError") is True):
+            return False
+        for key in ("deliveryStatus", "delivery_status", "status"):
+            if key in item:
+                if item[key] not in ("sent", "delivered"):
+                    return False
+                confirmed = confirmed or depth > 0
+        if depth > 0 and (item.get("ok") is True or item.get("success") is True):
+            confirmed = True
+        message_id = item.get("messageId")
+        if ((isinstance(message_id, str) and message_id.strip())
+                or (type(message_id) is int and message_id > 0)):
+            confirmed = True
+        for key in ("payload", "result"):
+            child = item.get(key)
+            if isinstance(child, dict):
+                pending.append((child, depth + 1))
+        for key in ("results", "payloadOutcomes"):
+            children = item.get(key)
+            if isinstance(children, list):
+                if any(not isinstance(child, dict) for child in children):
+                    return False
+                pending.extend((child, depth + 1) for child in children)
+    return confirmed
+
+
+def _run_openclaw_notification(cmd, channel, provider_channel):
+    """Return explicit delivery semantics without exposing provider output."""
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=25)
+    except (FileNotFoundError, PermissionError) as exc:
+        # These exec failures happen before a child can submit the notification.
+        return {"ok": False, "channel": channel, "delivery_status": "not_sent",
+                "attempted": False, "error": _safe_error_summary(exc)}
+    except Exception as exc:
+        # Timeout/read/decoding errors can occur after provider acceptance.
+        return {"ok": False, "channel": channel, "delivery_status": "unknown",
+                "attempted": True, "error": _safe_error_summary(exc)}
+    if proc.returncode != 0:
+        # OpenClaw can fail in post-send hooks or bookkeeping after acceptance.
+        return {"ok": False, "channel": channel, "delivery_status": "unknown",
+                "attempted": True, "returncode": proc.returncode,
+                "error": _safe_error_summary(proc.stderr or proc.stdout)}
+    try:
+        payload = json.loads(proc.stdout or "")
+    except (ValueError, TypeError):
+        payload = None
+    if not isinstance(payload, dict):
+        return {"ok": False, "channel": channel, "delivery_status": "unknown",
+                "attempted": True, "error": "通知返回格式无效；无法确认发送结果，请勿自动重发。"}
+    if not _openclaw_message_confirmed(payload, provider_channel):
+        return {"ok": False, "channel": channel, "delivery_status": "unknown",
+                "attempted": True, "error": "通知服务未明确确认发送成功；请核实送达结果，勿自动重发。"}
+    return {"ok": True, "channel": channel, "provider_channel": provider_channel,
+            "delivery_status": "delivered", "attempted": True,
+            "response": {"ok": True}}
+
+
+
+
+
+
+
+
+
+
+
+
+class MonitorDeliveryBlocked(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def _monitor_delivery_path():
+    return MONITOR_STATE_PATH + ".delivery.json"
+
+
+def _delivery_blocked(code="delivery_state_unavailable"):
+    return {"ok": False, "blocked": True, "delivery_status": "unknown",
+            "error": code,
+            "message": "投递状态尚未确认，已暂停通知。请运行 monitor delivery status 核查并人工确认；不会自动重发。"}
+
+
+def _delivery_private_file(path, flags):
+    fd = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), 0o600)
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+        os.close(fd)
+        raise MonitorDeliveryBlocked("delivery_file_unsafe")
+    return fd
+
+
+def _delivery_sync_dir():
+    fd = os.open(os.path.dirname(_monitor_delivery_path()), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _monitor_delivery_lock():
+    os.makedirs(os.path.dirname(_monitor_delivery_path()), exist_ok=True)
+    fd = _delivery_private_file(_monitor_delivery_path() + ".lock", os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise MonitorDeliveryBlocked("delivery_busy")
+        yield
+    finally:
+        os.close(fd)
+
+
+def _delivery_validate_marker():
+    try:
+        fd = _delivery_private_file(_monitor_delivery_path() + ".initialized", os.O_RDONLY)
+    except FileNotFoundError:
+        raise MonitorDeliveryBlocked("delivery_marker_missing")
+    try:
+        if os.read(fd, 4) != b"1\n":
+            raise MonitorDeliveryBlocked("delivery_marker_invalid")
+    finally:
+        os.close(fd)
+
+
+def _delivery_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _delivery_json_constant(value):
+    raise ValueError("nonfinite JSON constant")
+
+
+def _validate_monitor_delivery_data(data):
+    def timestamp(value):
+        return type(value) in {int, float} and math.isfinite(value) and value >= 0
+
+    if (not isinstance(data, dict) or set(data) != {"version", "transactions"}
+            or type(data.get("version")) is not int or data["version"] != 1
+            or not isinstance(data.get("transactions"), list)):
+        raise ValueError()
+    ids = set()
+    active = 0
+    for index, entry in enumerate(data["transactions"]):
+        if (not isinstance(entry, dict)
+                or set(entry) - {"id", "state", "created_at", "alerts", "channels", "completed_at"}
+                or not isinstance(entry.get("id"), str)
+                or not re.fullmatch(r"[0-9a-f]{32}", entry["id"]) or entry["id"] in ids):
+            raise ValueError()
+        ids.add(entry["id"])
+        if entry.get("state") not in {"active", "complete"} or not timestamp(entry.get("created_at")):
+            raise ValueError()
+        active += entry["state"] == "active"
+        if entry["state"] == "active" and (index != len(data["transactions"]) - 1 or "completed_at" in entry):
+            raise ValueError()
+        if entry["state"] == "complete" and not timestamp(entry.get("completed_at")):
+            raise ValueError()
+        if not isinstance(entry.get("alerts"), list) or not isinstance(entry.get("channels"), list) or not entry["channels"]:
+            raise ValueError()
+        channels = set()
+        for channel in entry["channels"]:
+            if (not isinstance(channel, dict)
+                    or set(channel) - {"channel", "status", "attempted_at", "confirmed_at", "resolved_at", "resolution"}
+                    or channel.get("channel") not in {"telegram", "weixin", "qq"}
+                    or channel["channel"] in channels
+                    or channel.get("status") not in {"pending", "inflight", "delivered", "not_sent", "unknown", "skipped", "abandoned"}):
+                raise ValueError()
+            channels.add(channel["channel"])
+            for field in ("attempted_at", "confirmed_at", "resolved_at"):
+                if field in channel and not timestamp(channel[field]):
+                    raise ValueError()
+            status = channel["status"]
+            if status in {"pending", "skipped"}:
+                if set(channel) != {"channel", "status"}:
+                    raise ValueError()
+            elif "attempted_at" not in channel:
+                raise ValueError()
+            if (status == "delivered") != ("confirmed_at" in channel):
+                raise ValueError()
+            if ("resolution" in channel) != ("resolved_at" in channel):
+                raise ValueError()
+            if "resolution" in channel:
+                if {"delivered": "delivered", "not-delivered": "not_sent", "abandon": "abandoned"}.get(channel["resolution"]) != status:
+                    raise ValueError()
+            elif status == "abandoned":
+                raise ValueError()
+        for alert in entry["alerts"]:
+            if not isinstance(alert, dict) or "_cooldown_key" not in alert or any(k not in {"_cooldown_key", "_strategy_active_key"} or not isinstance(v, str) or not v.strip() or len(v) > 512 for k, v in alert.items()):
+                raise ValueError()
+        if entry["state"] == "complete" and any(c["status"] in {"pending", "inflight", "unknown"} for c in entry["channels"]):
+            raise ValueError()
+    if active > 1:
+        raise ValueError()
+
+
+def _read_monitor_delivery_unlocked():
+    path = _monitor_delivery_path()
+    marker_exists = os.path.lexists(path + ".initialized")
+    if marker_exists:
+        _delivery_validate_marker()
+    try:
+        fd = _delivery_private_file(path, os.O_RDONLY)
+    except FileNotFoundError:
+        if marker_exists:
+            raise MonitorDeliveryBlocked("delivery_history_missing")
+        return {"version": 1, "transactions": []}
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            if not marker_exists:
+                raise MonitorDeliveryBlocked("delivery_marker_missing")
+            data = json.load(handle, object_pairs_hook=_delivery_json_object, parse_constant=_delivery_json_constant)
+        _validate_monitor_delivery_data(data)
+        return data
+    except MonitorDeliveryBlocked:
+        raise
+    except Exception:
+        raise MonitorDeliveryBlocked("delivery_history_invalid")
+
+
+def _write_monitor_delivery_unlocked(data):
+    _validate_monitor_delivery_data(data)
+    path = _monitor_delivery_path()
+    marker = path + ".initialized"
+    if not os.path.lexists(marker):
+        fd = _delivery_private_file(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, b"1\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _delivery_sync_dir()
+    else:
+        _delivery_validate_marker()
+    if os.path.lexists(path):
+        fd = _delivery_private_file(path, os.O_RDONLY)
+        os.close(fd)
+    temporary = path + ".tmp." + uuid.uuid4().hex
+    try:
+        fd = _delivery_private_file(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _delivery_sync_dir()
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+def _delivery_entry_summary(entry):
+    return {"id": entry["id"], "state": entry["state"], "created_at": entry["created_at"],
+            "channels": [{k: v for k, v in item.items() if k in {"channel", "status", "resolution", "resolved_at"}} for item in entry["channels"]],
+            "alert_count": len(entry["alerts"])}
+
+
+def monitor_delivery_status():
+    try:
+        with _monitor_delivery_lock():
+            data = _read_monitor_delivery_unlocked()
+            active = next((e for e in data["transactions"] if e["state"] == "active"), None)
+            return {"ok": True, "blocked": active is not None, "delivery_policy": "any_channel_success",
+                    "active": _delivery_entry_summary(active) if active else None,
+                    "history_count": len(data["transactions"]),
+                    "message": "存在待恢复或待人工确认的投递。" if active else "没有未确认投递。",
+                    "recovery_actions": {"delivered": "已在接收端确认送达；仅提交冷却，不再发送。",
+                                         "not-delivered": "确认未送达；若所有通道均未送达，允许后续新鲜行情重新评估，不重放旧消息。",
+                                         "abandon": "放弃本次候选并提交冷却，不再发送。"}}
+    except MonitorDeliveryBlocked as exc:
+        return _delivery_blocked(exc.code)
+    except Exception:
+        return _delivery_blocked()
+
+
+def _finish_monitor_delivery_unlocked(data, entry):
+    unknown = [c for c in entry["channels"] if c["status"] in {"inflight", "unknown"}]
+    if unknown:
+        return dict(_delivery_blocked("delivery_confirmation_required"), delivery_id=entry["id"],
+                    channels=_delivery_entry_summary(entry)["channels"])
+    if any(c["status"] == "pending" for c in entry["channels"]):
+        return _delivery_blocked("delivery_attempt_incomplete")
+    confirmed = [c for c in entry["channels"] if c["status"] in {"delivered", "abandoned"}]
+    committed = False
+    if confirmed:
+        stamp = max(c.get("confirmed_at", c.get("resolved_at", entry["created_at"])) for c in confirmed)
+        if not _commit_alert_cooldowns(entry["alerts"], sent_at=stamp):
+            return dict(_delivery_blocked("delivery_cooldown_pending"), delivery_id=entry["id"])
+        committed = True
+    entry["state"] = "complete"
+    entry["completed_at"] = time.time()
+    _write_monitor_delivery_unlocked(data)
+    return {"ok": True, "blocked": False, "delivery_id": entry["id"], "cooldown_committed": committed}
+
+
+def _recover_monitor_delivery_unlocked(data):
+    entry = next((e for e in data["transactions"] if e["state"] == "active"), None)
+    if entry is None:
+        return {"ok": True, "blocked": False}
+    changed = False
+    for channel in entry["channels"]:
+        if channel["status"] == "inflight":
+            channel["status"] = "unknown"
+            changed = True
+        elif channel["status"] == "pending":
+            # No transport call was permitted before inflight was durably written.
+            channel["status"] = "skipped"
+            changed = True
+    if changed:
+        _write_monitor_delivery_unlocked(data)
+    return _finish_monitor_delivery_unlocked(data, entry)
+
+
+def monitor_delivery_recover():
+    try:
+        load_monitor_state()  # Refuse recovery through damaged cooldown state.
+        with _monitor_delivery_lock():
+            return _recover_monitor_delivery_unlocked(_read_monitor_delivery_unlocked())
+    except MonitorDeliveryBlocked as exc:
+        return _delivery_blocked(exc.code)
+    except Exception:
+        return _delivery_blocked()
+
+
+def monitor_delivery_resolve(delivery_id, channel, action):
+    if (not re.fullmatch(r"[0-9a-f]{32}", str(delivery_id)) or channel not in {"telegram", "weixin", "qq"}
+            or action not in {"delivered", "not-delivered", "abandon"}):
+        return {"ok": False, "error": "delivery_resolution_invalid", "message": "用法：monitor delivery resolve ID CHANNEL delivered|not-delivered|abandon"}
+    try:
+        load_monitor_state()
+        with _monitor_delivery_lock():
+            data = _read_monitor_delivery_unlocked()
+            entry = next((e for e in data["transactions"] if e["id"] == delivery_id and e["state"] == "active"), None)
+            item = next((c for c in entry["channels"] if c["channel"] == channel), None) if entry else None
+            if item is None or item["status"] not in {"unknown", "inflight"}:
+                return {"ok": False, "error": "delivery_resolution_not_pending"}
+            # Invalid/stale requests must never recover or alter another transaction.
+            _recover_monitor_delivery_unlocked(data)
+            item["resolution"] = action
+            item["resolved_at"] = time.time()
+            item["status"] = {"delivered": "delivered", "not-delivered": "not_sent", "abandon": "abandoned"}[action]
+            if action == "delivered":
+                item["confirmed_at"] = item["resolved_at"]
+            _write_monitor_delivery_unlocked(data)
+            result = _finish_monitor_delivery_unlocked(data, entry)
+            result["message_sent"] = False
+            return result
+    except MonitorDeliveryBlocked as exc:
+        return _delivery_blocked(exc.code)
+    except Exception:
+        return _delivery_blocked()
+
+
+def _delivery_transport_status(result):
+    # Transport code must supply a positive acknowledgement, not just exit=0.
+    if isinstance(result, dict) and result.get("delivery_status") == "delivered" and result.get("ok") is True:
+        return "delivered"
+    if isinstance(result, dict) and result.get("delivery_status") == "not_sent" and result.get("ok") is False:
+        return "not_sent"
+    return "unknown"
+
+
+def _send_monitor_notification_channel(channel, text):
+    return send_openclaw_message(channel, text)
+
+
+def _monitor_delivery_minimal_alerts(alerts):
+    if alerts is None:
+        return []
+    if not isinstance(alerts, list):
+        raise MonitorDeliveryBlocked("delivery_alerts_invalid")
+    result = []
+    for alert in alerts:
+        if not isinstance(alert, dict) or "_cooldown_key" not in alert:
+            raise MonitorDeliveryBlocked("delivery_alerts_invalid")
+        minimal = {key: alert[key] for key in ("_cooldown_key", "_strategy_active_key") if key in alert}
+        if any(not isinstance(value, str) or not value.strip() or len(value) > 512 for value in minimal.values()):
+            raise MonitorDeliveryBlocked("delivery_alerts_invalid")
+        result.append(minimal)
+    return result
+
+
+
+
+
+
+def _monitor_health_lines(status):
+    lines = []
+    state = status.get("state_health") or {}
+    if state.get("blocked"):
+        lines.append("- 盯盘已暂停：" + state.get("message", "状态不可用，请保留原文件并检查。"))
+        lines.append("- 状态原因：" + str(state.get("code", "state_unavailable")))
+    delivery = status.get("delivery") or {}
+    if delivery.get("blocked"):
+        lines.append("- 自动通知已暂停：" + delivery.get("message", "存在尚未完成的投递记录，需要核实。"))
+        active = delivery.get("active") or {}
+        if active:
+            lines.append("- 待核实投递：" + active["id"])
+            for item in active.get("channels", []):
+                lines.append("- " + item["channel"] + "：" + item["status"])
+        lines.append("- 查看详情：monitor delivery status；确认收件端结果后再执行 resolve。")
+    return lines
+
+
+def monitor_delivery_command(args):
+    if not args or args == ["status"]:
+        return monitor_delivery_status()
+    if args == ["recover"]:
+        return monitor_delivery_recover()
+    if len(args) == 4 and args[0] == "resolve":
+        return monitor_delivery_resolve(args[1], args[2], args[3])
+    return {"ok": False, "error": "delivery_command_invalid", "message_sent": False,
+            "message": "用法：monitor delivery status | recover | resolve ID CHANNEL delivered|not-delivered|abandon"}
+
+
+
 def _default_monitor_state():
     return {
         "last_alerts": {},
@@ -4014,33 +4829,51 @@ def _locked_file(path, exclusive=True, blocking=True):
             lock_file.close()
 
 
-def _read_monitor_state_unlocked():
-    if not os.path.exists(MONITOR_STATE_PATH):
-        return _default_monitor_state()
-    try:
-        with open(MONITOR_STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return _default_monitor_state()
-    if not isinstance(data, dict):
-        return _default_monitor_state()
-    data.setdefault("last_alerts", {})
-    data.setdefault("last_quotes", {})
-    data.setdefault("strategy_active", {})
-    data.setdefault("last_checked_symbols", [])
-    data.setdefault("last_alert_candidates", [])
-    data.setdefault("last_suppressed", [])
-    return data
+def _read_monitor_state_unlocked(history_expected=False):
+    return _monitor_state_snapshot(history_expected=history_expected)[0]
+
 
 
 def _write_monitor_state_unlocked(state):
-    state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    tmp = f"{MONITOR_STATE_PATH}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, MONITOR_STATE_PATH)
+    incoming = _validate_monitor_state(state)
+    current_state, expected = _monitor_state_snapshot()
+    if incoming['revision'] != current_state['revision']:
+        raise MonitorStateBlocked('state_revision_conflict')
+    incoming['revision'] = current_state['revision'] + 1
+    incoming['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    serialized = json.dumps(incoming, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
+    if len(serialized) > _MONITOR_STATE_MAX_BYTES:
+        raise MonitorStateBlocked('state_too_large')
+    _monitor_state_ensure_marker()
+    directory = os.path.dirname(os.path.abspath(MONITOR_STATE_PATH))
+    temporary = None
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix='.monitor-state-', suffix='.tmp', dir=directory)
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        current = _monitor_state_lstat(MONITOR_STATE_PATH)
+        if ((expected is None) != (current is None) or
+                (expected is not None and _monitor_state_identity(expected) != _monitor_state_identity(current))):
+            raise MonitorStateBlocked('state_changed_before_write')
+        if not _monitor_state_marker_present():
+            raise MonitorStateBlocked('state_marker_invalid')
+        os.replace(temporary, MONITOR_STATE_PATH)
+        temporary = None
+        _MONITOR_STATE_OBSERVED_PATHS.add(os.path.abspath(MONITOR_STATE_PATH))
+        _monitor_state_fsync_directory()
+    except MonitorStateBlocked:
+        raise
+    except OSError:
+        raise MonitorStateBlocked('state_write_failed') from None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
 
 
 def _merge_alert_timestamps(current, incoming):
@@ -4071,35 +4904,29 @@ def _merge_last_quotes(current, incoming):
     return merged
 
 
-def load_monitor_state():
-    try:
-        with _locked_file(MONITOR_STATE_LOCK_PATH, exclusive=False):
-            return _read_monitor_state_unlocked()
-    except Exception:
-        return _default_monitor_state()
+def load_monitor_state(history_expected=False):
+    with _locked_monitor_state():
+        return _read_monitor_state_unlocked(history_expected=history_expected)
+
 
 
 def save_monitor_state(state):
     try:
-        with _locked_file(MONITOR_STATE_LOCK_PATH, exclusive=True):
+        incoming = _validate_monitor_state(state)
+        with _locked_monitor_state():
             current = _read_monitor_state_unlocked()
+            if incoming['revision'] != current['revision']:
+                raise MonitorStateBlocked('state_revision_conflict')
             merged = dict(current)
-            merged.update({
-                k: v for k, v in state.items()
-                if k not in {"last_alerts", "last_quotes", "updated_at"}
-            })
-            merged["last_alerts"] = _merge_alert_timestamps(
-                current.get("last_alerts", {}),
-                state.get("last_alerts", {})
-            )
-            merged["last_quotes"] = _merge_last_quotes(
-                current.get("last_quotes", {}),
-                state.get("last_quotes", {})
-            )
+            merged.update({key: value for key, value in incoming.items()
+                           if key not in {'last_alerts', 'last_quotes', 'updated_at'}})
+            merged['last_alerts'] = _merge_alert_timestamps(current.get('last_alerts', {}), incoming.get('last_alerts', {}))
+            merged['last_quotes'] = _merge_last_quotes(current.get('last_quotes', {}), incoming.get('last_quotes', {}))
             _write_monitor_state_unlocked(merged)
-            return True
+        return True
     except Exception:
         return False
+
 
 
 def _monitor_to_float(x, default=None):
@@ -4880,7 +5707,10 @@ def strategy_check():
     strategy = cfg.get("strategy_monitor", {}) or {}
     process = monitor_pid_status()
     trading = trading_time_status()
-    runtime_state = load_monitor_state()
+    try:
+        runtime_state = load_monitor_state()
+    except MonitorStateBlocked as exc:
+        return {**exc.as_status(), "status": "FAIL", "probe_executed": False}
     selfcheck_state = _strategy_selfcheck_state()
     holding_pool = list(cfg.get("holding_pool", []) or [])
     watch_pool = list(cfg.get("watch_pool", []) or [])
@@ -4981,6 +5811,7 @@ def strategy_check():
             else "策略配置、行情连接与策略引擎自检可用。"
         ),
     }
+
 
 
 def _parse_strategy_mock_text(mock_text):
@@ -5086,7 +5917,7 @@ def strategy_simulate(symbol, preset="breakout", mock_text="", send_test=False):
     )
     send_result = None
     if send_test:
-        send_result = send_telegram_message(reminder)
+        send_result = send_monitor_notification(reminder)
 
     state = _strategy_selfcheck_state()
     simulated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -5120,6 +5951,7 @@ def strategy_simulate(symbol, preset="breakout", mock_text="", send_test=False):
             "仅运行本地模拟判断；未读取真实行情、未启动盯盘。"
         ),
     }
+
 
 
 def _gateway_probe_for_strategy_test():
@@ -5180,7 +6012,12 @@ def strategy_test(rule_id, symbol=None, live_probe=True):
 
 
 def build_strategy_alerts_once():
-    cfg = load_watchlist_config()
+    try:
+        cfg = load_watchlist_config()
+    except Exception:
+        return {"ok": False, "blocked": True, "alerts": [], "alerts_count": 0,
+                "checked_count": 0, "error": "notification_config_unavailable",
+                "message": "盯盘配置不可用，已停止扫描及发送；请检查配置。"}
     monitor = cfg.get("monitor", {}) or {}
     strategy = cfg.get("strategy_monitor", {}) or {}
     holdings = cfg.get("holding_pool", []) or []
@@ -5217,7 +6054,10 @@ def build_strategy_alerts_once():
         }
 
     started = time.monotonic()
-    state = load_monitor_state()
+    try:
+        state = load_monitor_state()
+    except MonitorStateBlocked as exc:
+        return {**exc.as_status(), "alerts": [], "alerts_count": 0, "checked_count": 0}
     active = state.setdefault("strategy_active", {})
     alerts, checked, suppressed, runtime_unavailable = [], [], [], []
     _, profile = _get_monitor_profile(cfg)
@@ -5296,7 +6136,9 @@ def build_strategy_alerts_once():
     state["last_suppressed"] = suppressed[-50:]
     state["last_alert_candidates"] = alerts[-50:]
     saved = save_monitor_state(state)
+    committed_revision = state.get("revision", 0) + 1 if saved else None
     return {
+        "state_revision": committed_revision,
         "ok": saved, "monitor_enabled": True, "mode": "strategy", "profile_name": "策略盯盘",
         "interval_seconds": profile.get("interval_seconds", 1), "cooldown_minutes": cooldown_minutes,
         "targets": list(strategy_targets), "checked_count": len(checked), "checked": checked,
@@ -5306,6 +6148,7 @@ def build_strategy_alerts_once():
         "last_scan_at": state["last_scan_at"], "last_quote_at": state["last_quote_at"],
         "scan_duration_ms": round((time.monotonic() - started) * 1000, 2),
     }
+
 
 
 def _alert_key(code, rule):
@@ -5392,29 +6235,28 @@ def _append_normal_alert(alerts, suppressed, state, alert, cooldown_minutes):
 
 
 def _commit_alert_cooldowns(alerts, sent_at=None):
-    keys = {
-        alert.get("_cooldown_key")
-        for alert in (alerts or [])
-        if isinstance(alert, dict) and alert.get("_cooldown_key")
-    }
-    if not keys:
-        return True
-
+    keys = {alert.get('_cooldown_key') for alert in (alerts or [])
+            if isinstance(alert, dict) and alert.get('_cooldown_key')}
     try:
-        with _locked_file(MONITOR_STATE_LOCK_PATH, exclusive=True):
+        timestamp = sent_at if sent_at is not None else time.time()
+        if not _monitor_state_finite_number(timestamp):
+            raise MonitorStateBlocked('state_schema_invalid')
+        with _locked_monitor_state():
             state = _read_monitor_state_unlocked()
-            last_alerts = state.setdefault("last_alerts", {})
-            timestamp = float(sent_at if sent_at is not None else time.time())
+            if not keys:
+                return True
+            last_alerts = state.setdefault('last_alerts', {})
             for key in keys:
-                last_alerts[key] = timestamp
-            active = state.setdefault("strategy_active", {})
+                last_alerts[key] = max(float(last_alerts.get(key, 0)), float(timestamp))
+            active = state.setdefault('strategy_active', {})
             for alert in alerts or []:
-                if isinstance(alert, dict) and alert.get("_strategy_active_key"):
-                    active[alert["_strategy_active_key"]] = True
+                if isinstance(alert, dict) and alert.get('_strategy_active_key'):
+                    active[alert['_strategy_active_key']] = True
             _write_monitor_state_unlocked(state)
         return True
     except Exception:
         return False
+
 
 
 def _get_monitor_profile(cfg):
@@ -5587,7 +6429,12 @@ def build_monitor_alerts_once():
     单次盯盘检查。
     第一版只按涨跌幅阈值判断，不调用大模型。
     """
-    cfg = load_watchlist_config()
+    try:
+        cfg = load_watchlist_config()
+    except Exception:
+        return {"ok": False, "blocked": True, "alerts": [], "alerts_count": 0,
+                "checked_count": 0, "error": "notification_config_unavailable",
+                "message": "盯盘配置不可用，已停止扫描及发送；请检查配置。"}
     monitor = cfg.get("monitor", {}) or {}
     enabled = bool(monitor.get("enabled", False))
 
@@ -5626,7 +6473,10 @@ def build_monitor_alerts_once():
             )
         }
 
-    state = load_monitor_state()
+    try:
+        state = load_monitor_state()
+    except MonitorStateBlocked as exc:
+        return {**exc.as_status(), "alerts": [], "alerts_count": 0, "checked_count": 0}
 
     watch_items = cfg.get("watch_pool", []) or []
     holding_items = cfg.get("holding_pool", []) or []
@@ -5820,8 +6670,10 @@ def build_monitor_alerts_once():
     state["last_alert_candidates"] = candidates[-50:]
     state["last_suppressed"] = suppressed[-50:]
     saved = save_monitor_state(state)
+    committed_revision = state.get("revision", 0) + 1 if saved else None
 
     return {
+        "state_revision": committed_revision,
         "ok": saved,
         "monitor_enabled": True,
         "mode": mode,
@@ -5841,6 +6693,7 @@ def build_monitor_alerts_once():
         "alerts": alerts,
         "note": "普通盯盘沿用原严密盯盘阈值；本地判断，不调用大模型。"
     }
+
 
 
 
@@ -5880,74 +6733,32 @@ def _notification_targets():
 
 
 def send_openclaw_message(channel, text):
-    """Delegate delivery to an already configured OpenClaw channel extension."""
-    normalized = _normalize_channel_name(channel)
-    delivery = _notification_targets().get(normalized)
-    if isinstance(delivery, str):
-        delivery = {"target": delivery}
-    if not isinstance(delivery, dict) or not str(delivery.get("target") or "").strip():
-        return {
-            "ok": False,
-            "skipped": True,
-            "channel": normalized,
-            "error": "未配置通知目标；为防止误发，本次已跳过。",
-        }
-
-    provider_channel = {
-        "weixin": "openclaw-weixin",
-        "telegram": "telegram",
-        "qq": "qqbot",
-    }.get(normalized, normalized)
-    cmd = [
-        "openclaw", "message", "send",
-        "--channel", provider_channel,
-        "--target", str(delivery["target"]),
-        "--message", str(text),
-        "--json",
-    ]
-    if delivery.get("account"):
-        cmd[3:3] = ["--account", str(delivery["account"])]
+    """Delegate to the explicitly selected channel and require a send receipt."""
     try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=25,
-        )
-        if proc.returncode != 0:
-            return {
-                "ok": False,
-                "channel": normalized,
-                "error": _safe_error_summary(proc.stderr or proc.stdout),
-                "returncode": proc.returncode,
-            }
-        try:
-            payload = json.loads(proc.stdout or "")
-        except (ValueError, TypeError):
-            return {"ok": False, "channel": normalized,
-                    "error": "通知返回格式无效；无法确认发送结果。"}
-        if not isinstance(payload, dict):
-            return {"ok": False, "channel": normalized,
-                    "error": "通知返回格式无效；无法确认发送结果。"}
-        confirmations = [payload]
-        if isinstance(payload.get("payload"), dict):
-            confirmations.append(payload["payload"])
-        if any(item.get("ok") is False or item.get("success") is False or item.get("error")
-               for item in confirmations):
-            return {"ok": False, "channel": normalized,
-                    "error": "通知服务未确认发送成功；请检查通道状态。"}
-        return {
-            "ok": True,
-            "channel": normalized,
-            "provider_channel": provider_channel,
-            "target_masked": str(delivery["target"])[:4] + "***",
-            # Keep a local confirmation only; provider bodies can contain
-            # credentials or diagnostic text even when the command succeeds.
-            "response": {"ok": True},
-        }
+        normalized = _validated_notify_channel(channel)
+    except ValueError:
+        return {"ok": False, "skipped": True, "delivery_status": "not_sent",
+                "attempted": False, "error_code": "notification_channel_invalid",
+                "error": "通知通道无效；本次未发送。"}
+    try:
+        delivery = _notification_targets().get(normalized)
+        if isinstance(delivery, str):
+            delivery = {"target": delivery}
+        if not isinstance(delivery, dict) or not str(delivery.get("target") or "").strip():
+            return {"ok": False, "skipped": True, "channel": normalized,
+                    "delivery_status": "not_sent", "attempted": False,
+                    "error": "未配置通知目标；为防止误发，本次已跳过。"}
+        provider_channel = {"weixin": "openclaw-weixin", "telegram": "telegram",
+                            "qq": "qqbot"}[normalized]
+        cmd = ["openclaw", "message", "send", "--channel", provider_channel,
+               "--target", str(delivery["target"]), "--message", str(text), "--json"]
+        if delivery.get("account"):
+            cmd[3:3] = ["--account", str(delivery["account"])]
     except Exception as exc:
-        return {"ok": False, "channel": normalized, "error": _safe_error_summary(exc)}
+        return {"ok": False, "channel": normalized, "delivery_status": "not_sent",
+                "attempted": False, "error": _safe_error_summary(exc)}
+    return _run_openclaw_notification(cmd, normalized, provider_channel)
+
 
 
 def send_telegram_message(text):
@@ -5958,38 +6769,77 @@ def send_weixin_message(text):
     return send_openclaw_message("weixin", text)
 
 
-def send_monitor_notification(text, channels=None, source_channel=None):
-    channels = _normalize_notify_channels(
-        {"notify_channels": channels or []},
-        include_fallback=not bool(channels),
-    )
-    results = []
-    for channel in channels:
-        result = send_openclaw_message(channel, text)
-        results.append(result)
-
-    ok = any(item.get("ok") for item in results)
-    payload = {
-        "ok": ok,
-        "partial": ok and any(not item.get("ok") for item in results),
-        "successful_channels": [item.get("channel") for item in results if item.get("ok")],
-        "failed_channels": [item.get("channel") for item in results if not item.get("ok")],
-        "delivery_policy": "any_channel_success",
-        "source_channel": _normalize_channel_name(source_channel),
-        "notify_channels": channels,
-        "results": results,
-        "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+def send_monitor_notification(text, channels=None, source_channel=None, alerts=None, expected_state_revision=None):
+    scope = _notification_channel_scope(channels)
+    if not scope.get("ok"):
+        return scope
+    channels = scope["notify_channels"]
     try:
+        minimal_alerts = _monitor_delivery_minimal_alerts(alerts)
         state = load_monitor_state()
-        state["last_notify_result"] = payload
-        save_monitor_state(state)
-        cfg = load_watchlist_config()
-        cfg.setdefault("monitor", {})["last_notify_result"] = payload
-        save_watchlist_config(cfg)
+        # Establish the cooldown state before the independent journal marker.
+        if not os.path.lexists(MONITOR_STATE_PATH) and not save_monitor_state(state):
+            return _delivery_blocked("monitor_state_unavailable")
+        with _monitor_delivery_lock():
+            data = _read_monitor_delivery_unlocked()
+            recovered = _recover_monitor_delivery_unlocked(data)
+            if not recovered.get("ok"):
+                return recovered
+            # The caller's candidate could predate a recovered ACK. Require a fresh scan.
+            if recovered.get("cooldown_committed"):
+                return {"ok": False, "blocked": False, "skipped": True, "error": "delivery_recovered_rescan_required", "cooldown_committed": True}
+            # A concurrent completed delivery or scan can invalidate the caller's
+            # candidate while it waits for this lock. Never send a stale snapshot.
+            state = load_monitor_state()
+            if minimal_alerts and (type(expected_state_revision) is not int or expected_state_revision < 0
+                                   or state.get("revision", 0) != expected_state_revision):
+                return {"ok": False, "blocked": False, "skipped": True, "error": "delivery_candidate_stale",
+                        "message": "提醒候选对应的状态已变化，本轮未发送；等待下一次新鲜扫描。"}
+            entry = {"id": uuid.uuid4().hex, "state": "active", "created_at": time.time(), "alerts": minimal_alerts,
+                     "channels": [{"channel": c, "status": "pending"} for c in channels]}
+            data["transactions"].append(entry)
+            _write_monitor_delivery_unlocked(data)
+            results = []
+            for item in entry["channels"]:
+                item.update(status="inflight", attempted_at=time.time())
+                _write_monitor_delivery_unlocked(data)
+                try:
+                    result = _send_monitor_notification_channel(item["channel"], text)
+                except Exception:
+                    result = {"ok": False, "channel": item["channel"], "delivery_status": "unknown", "error": "通知结果未知。"}
+                outcome = _delivery_transport_status(result)
+                item["status"] = outcome
+                if outcome == "delivered":
+                    item["confirmed_at"] = time.time()
+                _write_monitor_delivery_unlocked(data)
+                results.append({"channel": item["channel"], "ok": outcome == "delivered", "delivery_status": outcome})
+                if outcome == "unknown":
+                    for remaining in entry["channels"]:
+                        if remaining["status"] == "pending":
+                            remaining["status"] = "skipped"
+                    _write_monitor_delivery_unlocked(data)
+                    break
+            finished = _finish_monitor_delivery_unlocked(data, entry)
+            delivered = [c["channel"] for c in entry["channels"] if c["status"] == "delivered"]
+            failed = [c["channel"] for c in entry["channels"] if c["status"] != "delivered"]
+            payload = {"ok": bool(delivered) and finished.get("ok", False), "partial": bool(delivered) and bool(failed),
+                       "successful_channels": delivered, "failed_channels": failed, "delivery_policy": "any_channel_success",
+                       "source_channel": _normalize_channel_name(source_channel), "notify_channels": channels, "results": results,
+                       "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "delivery_id": entry["id"],
+                       "blocked": finished.get("blocked", False), "cooldown_committed": finished.get("cooldown_committed", False)}
+            if finished.get("error"):
+                payload["error"] = finished["error"]
+                payload["message"] = finished["message"]
+            # Diagnostic persistence is separate from the durable acknowledgement.
+            state = load_monitor_state()
+            state["last_notify_result"] = payload
+            save_monitor_state(state)
+            return payload
+    except MonitorDeliveryBlocked as exc:
+        return _delivery_blocked(exc.code)
     except Exception:
-        pass
-    return payload
+        return _delivery_blocked()
+
 
 
 def format_monitor_alerts_for_telegram(result):
@@ -6026,17 +6876,23 @@ def format_monitor_alerts_for_telegram(result):
     return "\n".join(lines).strip()
 
 
-def _monitor_channel_arg(args, default="weixin"):
+def _monitor_channel_arg(args, default=None):
     channel = default
+    specified = False
     index = 0
     while index < len(args):
         value = args[index]
-        if value in {"--channel", "-c"} and index + 1 < len(args):
-            channel = args[index + 1]
+        if value in {"--channel", "-c"}:
+            if specified or index + 1 >= len(args):
+                raise ValueError("notification_channel_argument_invalid")
+            channel = _validated_notify_channel(args[index + 1])
+            specified = True
             index += 2
-        else:
+        elif value == "--json":
             index += 1
-    return _normalize_channel_name(channel)
+        else:
+            raise ValueError("notification_channel_argument_invalid")
+    return _validated_notify_channel(channel) if channel is not None else None
 
 
 def _format_monitor_diagnose(result):
@@ -6048,7 +6904,10 @@ def _format_monitor_diagnose(result):
     checked = scan.get("checked") or result.get("last_checked") or []
     candidates = scan.get("alert_candidates") or result.get("last_alert_candidates") or []
     suppressed = scan.get("suppressed") or result.get("last_suppressed") or []
-    notify_channels = _normalize_notify_channels(monitor)
+    try:
+        notify_channels = _normalize_notify_channels(monitor, include_fallback=False)
+    except ValueError:
+        notify_channels = []
     channel_display = {"weixin": "微信", "telegram": "Telegram", "qq": "QQ"}
     delivery = result.get("last_notify_result") or {}
     channel_results = delivery.get("results") or []
@@ -6118,70 +6977,82 @@ def _format_monitor_diagnose(result):
         lines.append("- 有候选提醒且未被 cooldown 压制；若未收到，请看 last_notify_result。")
 
     lines.extend(["", "六、结论", f"- {result.get('conclusion') or '-'}"])
+    warnings = _monitor_health_lines(status)
+    if warnings:
+        lines[1:1] = ["", *warnings, ""]
     return "\n".join(lines)
+
 
 
 def monitor_diagnose(raw_json=False):
     status = _monitor_status_with_runtime()
-    state = load_monitor_state()
+    state, scan_result = {}, None
     monitor = status.get("monitor", {}) or {}
-    scan_result = None
-    if monitor.get("enabled") and monitor.get("mode") == "normal":
-        scan_result = build_monitor_alerts_once()
-        state = load_monitor_state()
-
+    if not status.get("blocked"):
+        try:
+            state = load_monitor_state()
+            if (monitor.get("enabled") and monitor.get("mode") == "normal"
+                    and status.get("trading_time", {}).get("is_trading_time")):
+                scan_result = build_monitor_alerts_once()
+                state = load_monitor_state()
+        except MonitorStateBlocked as exc:
+            status.update(ok=False, blocked=True, state_health=exc.as_status())
     conclusion = "普通盯盘未开启。"
-    if monitor.get("enabled"):
+    if status.get("blocked"):
+        conclusion = "状态或投递记录待核实，已暂停自动扫描和发送。请保留原文件，先查看上方原因。"
+    elif monitor.get("enabled"):
         trading = status.get("trading_time") or {}
         if not trading.get("is_trading_time"):
-            conclusion = (
-                (trading.get("message") or "当前不在已确认的交易时间。")
-                + "后台若运行也只等待，不扫描实时行情。"
-                + _monitor_resume_message(trading)
-            )
+            if monitor.get("mode") == "normal":
+                scan_result = {"ok": True, "checked_count": 0, "alerts_count": 0,
+                               "alerts": [], "skipped": True, "trading_time": trading}
+            conclusion = ((trading.get("message") or "当前不在已确认的交易时间。")
+                          + "后台若运行也只等待，不扫描实时行情。" + _monitor_resume_message(trading))
+        elif scan_result and scan_result.get("ok") is False:
+            conclusion = "扫描状态未能保存；本轮不会发送，请检查状态存储或并发冲突。"
         elif scan_result and scan_result.get("alerts_count"):
             conclusion = "本次诊断发现候选提醒，真实后台会按 notify_channels 推送。"
         elif scan_result:
             conclusion = "本次诊断完成扫描，但未满足提醒阈值或被 cooldown 压制。"
-
-    result = {
-        "ok": True,
-        "status": status,
-        "scan_result": scan_result,
-        "last_scan_at": state.get("last_scan_at"),
-        "last_quote_at": state.get("last_quote_at"),
-        "last_checked": state.get("last_checked_symbols", []),
-        "last_quotes": state.get("last_quotes", {}),
-        "last_alert_candidates": state.get("last_alert_candidates", []),
-        "last_suppressed": state.get("last_suppressed", []),
-        "last_notify_result": state.get("last_notify_result"),
-        "conclusion": conclusion,
-    }
+    result = {"ok": not status.get("blocked") and (scan_result or {}).get("ok", True),
+              "blocked": bool(status.get("blocked")), "status": status, "scan_result": scan_result,
+              "last_scan_at": state.get("last_scan_at"), "last_quote_at": state.get("last_quote_at"),
+              "last_checked": state.get("last_checked_symbols", []), "last_quotes": state.get("last_quotes", {}),
+              "last_alert_candidates": state.get("last_alert_candidates", []),
+              "last_suppressed": state.get("last_suppressed", []),
+              "last_notify_result": state.get("last_notify_result"), "conclusion": conclusion}
     if raw_json:
         return result
     return {"_output_format": "text", "text": _format_monitor_diagnose(result)}
 
 
-def monitor_notify_test(channel="weixin"):
-    channel = _normalize_channel_name(channel)
+
+def monitor_notify_test(channel=None):
+    try:
+        channel = _validated_notify_channel(channel) if channel is not None else None
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
     text = (
         "【龙虾盯盘测试】\n"
-        "这是一条微信通知链路测试。\n"
+        "这是一条通知链路测试。\n"
         "来源：monitor notify-test\n"
-        f"通道：{channel}\n"
+        f"通道：{channel or '现有通知配置'}\n"
         f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         "说明：模拟/测试消息，不是真实交易信号。"
     )
     result = send_monitor_notification(
         text,
-        channels=[channel],
+        channels=[channel] if channel is not None else None,
         source_channel=channel,
     )
     return {"ok": bool(result.get("ok")), "test": True, "notify_result": result}
 
 
-def monitor_simulate_alert(channel="weixin"):
-    channel = _normalize_channel_name(channel)
+def monitor_simulate_alert(channel=None):
+    try:
+        channel = _validated_notify_channel(channel) if channel is not None else None
+    except ValueError:
+        return _notification_scope_error("notification_channel_invalid")
     result = {
         "mode": "normal",
         "profile_name": "普通盯盘",
@@ -6198,7 +7069,7 @@ def monitor_simulate_alert(channel="weixin"):
     text += format_monitor_alerts_for_telegram(result)
     notify_result = send_monitor_notification(
         text,
-        channels=[channel],
+        channels=[channel] if channel is not None else None,
         source_channel=channel,
     )
     return {
@@ -6234,28 +7105,29 @@ def monitor_loop():
     last_idle_log = 0.0
     notify_failures = 0
     retry_notification_at = 0.0
-    pending_delivery_commit = None
     try:
         _write_monitor_pid(own_pid)
         print_json({"ok": True, "message": "monitor_loop 已启动；关闭配置后会自动退出。", "pid": own_pid})
         while True:
-            cfg = load_watchlist_config()
-            monitor = cfg.get("monitor", {}) or {}
-            mode, profile = _get_monitor_profile(cfg)
+            try:
+                cfg = load_watchlist_config()
+                monitor = cfg.get("monitor", {}) or {}
+                mode, profile = _get_monitor_profile(cfg)
+            except Exception:
+                print_json({"ok": False, "event": "monitor_config_blocked", "message": "盯盘配置不可用；已停止扫描和发送，请检查配置。"})
+                _monitor_wait(5)
+                continue
             if not monitor.get("enabled"):
                 print_json({"ok": True, "message": "实时盯盘已关闭，monitor_loop 退出。"})
                 return
-            if pending_delivery_commit is not None:
-                # Delivery already succeeded. Retry only its acknowledgement while
-                # storage is unavailable; sending again would duplicate the message.
-                if _commit_alert_cooldowns(pending_delivery_commit["alerts"], sent_at=pending_delivery_commit["sent_at"]):
-                    pending_delivery_commit = None
-                    notify_failures = 0
-                    retry_notification_at = 0.0
-                else:
-                    print_json({"ok": False, "event": "monitor_delivery_commit_pending", "message": "提醒已送达，但状态保存失败；暂停新提醒并重试保存。"})
-                    _monitor_wait(5, mode)
-                    continue
+            # Recovery is local-only and precedes the trading-session gate.
+            recovery = monitor_delivery_recover()
+            if not recovery.get("ok"):
+                print_json({"ok": False, "event": "monitor_delivery_blocked", "recovery": recovery})
+                _monitor_wait(5, mode)
+                continue
+            if recovery.get("cooldown_committed"):
+                notify_failures, retry_notification_at = 0, 0.0
             if monitor.get("market_hours_only", True) and not trading_time_status().get("is_trading_time"):
                 if time.monotonic() - last_idle_log >= 60:
                     print_json({"ok": True, "event": "market_closed", "trading_time": trading_time_status(), "sleep_seconds": 30})
@@ -6266,50 +7138,52 @@ def monitor_loop():
             try:
                 result = build_monitor_alerts_once()
                 if result.get("ok") is False:
-                    print_json({"ok": False, "event": "monitor_scan_not_committed", "message": "扫描状态保存失败，本轮不发送提醒。"})
+                    print_json({"ok": False, "event": "monitor_scan_not_committed", "message": "扫描状态不可用或保存失败，本轮不发送提醒。"})
                     _monitor_wait(5, mode)
                     continue
-                # The user can turn monitoring off/change rules while I/O is in flight.
                 latest = load_watchlist_config()
                 latest_monitor = latest.get("monitor", {}) or {}
-                if not latest_monitor.get("enabled") or latest_monitor.get("mode") != mode or latest.get("strategy_monitor") != cfg.get("strategy_monitor"):
+                if (not latest_monitor.get("enabled") or latest_monitor.get("mode") != mode
+                        or latest.get("strategy_monitor") != cfg.get("strategy_monitor")):
                     continue
                 if result.get("alerts_count", 0) > 0:
                     print_json(result)
                     if time.monotonic() >= retry_notification_at:
-                        # The formatter displays ten alerts; acknowledge only that batch.
-                        # Remaining candidates stay pending for the next iteration.
                         batch = dict(result, alerts=result.get("alerts", [])[:10])
                         alert_text = format_monitor_alerts_for_telegram(batch)
                         if alert_text:
                             notify_started = time.monotonic()
-                            notify_result = send_monitor_notification(alert_text, channels=latest_monitor.get("notify_channels"), source_channel=latest_monitor.get("source_channel"))
-                            committed = False
-                            if notify_result.get("ok") is True:
-                                sent_at = time.time()
-                                committed = _commit_alert_cooldowns(batch["alerts"], sent_at=sent_at)
-                                if committed:
-                                    notify_failures = 0
-                                    retry_notification_at = 0.0
-                                else:
-                                    pending_delivery_commit = {"alerts": batch["alerts"], "sent_at": sent_at}
-                            else:
+                            notify_result = send_monitor_notification(
+                                alert_text, channels=_normalize_notify_channels(latest_monitor),
+                                source_channel=latest_monitor.get("source_channel"), alerts=batch["alerts"],
+                                expected_state_revision=batch.get("state_revision"))
+                            committed = bool(notify_result.get("cooldown_committed"))
+                            if committed:
+                                notify_failures, retry_notification_at = 0, 0.0
+                            elif not notify_result.get("blocked"):
                                 notify_failures += 1
                                 retry_notification_at = time.monotonic() + min(60, 5 * (2 ** min(notify_failures - 1, 4)))
-                            print_json({"ok": bool(notify_result.get("ok")) and committed, "event": "monitor_alert_sent" if committed else "monitor_delivery_uncommitted" if notify_result.get("ok") else "monitor_delivery_failed", "notify_result": notify_result, "cooldown_committed": committed, "notification_duration_ms": round((time.monotonic() - notify_started) * 1000, 2)})
+                            event = ("monitor_alert_sent" if notify_result.get("ok") else
+                                     "monitor_delivery_blocked" if notify_result.get("blocked") else "monitor_delivery_failed")
+                            print_json({"ok": bool(notify_result.get("ok")), "event": event,
+                                        "notify_result": notify_result, "cooldown_committed": committed,
+                                        "notification_duration_ms": round((time.monotonic() - notify_started) * 1000, 2)})
                 elif mode != "strategy" or time.monotonic() - last_idle_log >= 60:
-                    print_json({"ok": result.get("ok", True), "monitor_enabled": True, "mode": mode, "checked_count": result.get("checked_count"), "alerts_count": 0, "runtime_unavailable": result.get("runtime_unavailable", []), "scan_duration_ms": result.get("scan_duration_ms")})
+                    print_json({"ok": result.get("ok", True), "monitor_enabled": True, "mode": mode,
+                                "checked_count": result.get("checked_count"), "alerts_count": 0,
+                                "runtime_unavailable": result.get("runtime_unavailable", []),
+                                "scan_duration_ms": result.get("scan_duration_ms")})
                     last_idle_log = time.monotonic()
-            except Exception as exc:
-                print_json({"ok": False, "event": "monitor_iteration_failed", "error": str(exc)})
+            except Exception:
+                print_json({"ok": False, "event": "monitor_iteration_failed", "error": "本轮检查失败，已停止发送并等待重新检查。"})
                 _monitor_wait(5, mode)
                 continue
             minimum = 1 if mode == "strategy" else 15
             interval = max(minimum, float(profile.get("interval_seconds", minimum) or minimum))
-            # interval is start-to-start, not another full sleep after slow requests.
-            _monitor_wait(max(5 if pending_delivery_commit is not None else 0.1, interval - (time.monotonic() - scan_started)), mode)
+            _monitor_wait(max(0.1, interval - (time.monotonic() - scan_started)), mode)
     finally:
         _cleanup_monitor_runtime(own_pid, lock_file)
+
 
 
 
@@ -6567,6 +7441,9 @@ def monitor_start():
             "monitor": monitor
         }
 
+    recovery = monitor_delivery_recover()
+    if not recovery.get("ok"):
+        return {**recovery, "message": "通知或盯盘状态待恢复，未启动后台。请先查看 monitor delivery status 与 monitor diagnose。"}
     current_status = monitor_pid_status()
     if current_status.get("running"):
         return {
@@ -6624,6 +7501,7 @@ def monitor_start():
         "notify_channels": _normalize_notify_channels(monitor),
         "log_file": MONITOR_LOG_PATH
     }
+
 
 
 def monitor_stop():
@@ -6724,17 +7602,19 @@ def _parse_monitor_cli_args(args):
     index = 0
     while index < len(args):
         value = args[index]
-        if value in {"--channel", "-c"} and index + 1 < len(args):
-            channel = args[index + 1]
+        if value in {"--channel", "-c"}:
+            if channel is not None or index + 1 >= len(args):
+                raise ValueError("notification_channel_argument_invalid")
+            channel = _validated_notify_channel(args[index + 1])
             index += 2
-        elif value.startswith("--"):
+        elif value == "--json":
             index += 1
-        elif mode is None:
+        elif value.startswith("--") or mode is not None:
+            raise ValueError("notification_channel_argument_invalid")
+        else:
             mode = value
             index += 1
-        else:
-            index += 1
-    return mode, _normalize_channel_name(channel or _default_output_channel())
+    return mode, channel
 
 
 def _print_report_result(result, raw_json=False):
@@ -6913,8 +7793,11 @@ def main():
                     True,
                     mode=mode,
                     source_channel=channel,
-                    notify_channels=[channel],
+                    notify_channels=[channel] if channel is not None else None,
                 )
+                if not set_result.get("ok"):
+                    print_json(set_result)
+                    return
                 start_result = monitor_start()
                 verify_result = monitor_verify(expected_running=True, wait_seconds=1.2)
                 print_json({
@@ -6942,6 +7825,8 @@ def main():
                     print(result.get("text", ""))
                 else:
                     print_json(result)
+            elif action == "delivery":
+                print_json(monitor_delivery_command(sys.argv[3:]))
             elif action in {"diagnose", "诊断"}:
                 text = " ".join(sys.argv[3:]).strip()
                 result = monitor_diagnose(raw_json=_monitor_raw_output_requested(text))
@@ -6950,10 +7835,10 @@ def main():
                 else:
                     print_json(result)
             elif action in {"notify-test", "通知测试"}:
-                channel = _monitor_channel_arg(sys.argv[3:], default="weixin")
+                channel = _monitor_channel_arg(sys.argv[3:])
                 print_json(monitor_notify_test(channel))
             elif action in {"simulate-alert", "模拟提醒"}:
-                channel = _monitor_channel_arg(sys.argv[3:], default="weixin")
+                channel = _monitor_channel_arg(sys.argv[3:])
                 print_json(monitor_simulate_alert(channel))
             else:
                 print_json({"error": f"未知盯盘操作：{action}"})
@@ -7097,6 +7982,7 @@ def main():
             print_json({"error": f"未知命令：{cmd}"})
     except Exception as e:
         print_json({"error": str(e)})
+
 
 
 if __name__ == "__main__":

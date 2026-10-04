@@ -8,7 +8,10 @@ All notable changes are recorded here. Versions follow Semantic Versioning.
 
 - Preserve every supported strategy condition, comparison, direction, timeframe and explicit symbol; reject ambiguous combinations instead of silently changing their meaning. Return a readable execution preview and keep the previous strategy when parsing fails.
 - Fetch only the data required by each strategy, share a bounded worker pool, cache daily history briefly, and report per-source timing. Reject stale or invalid data before evaluating signals.
-- Commit alert activation only after delivery, preserve activation across unavailable data, and restore enabled monitoring through the verified process lifecycle.
+- Commit alert activation after verified delivery or explicit abandonment, preserve activation across unavailable data, and restore enabled monitoring through the verified process lifecycle.
+- Keep explicit notification scope authoritative, including empty lists. Preserve existing channels on unqualified starts; reject invalid channels before any send and never append implicit fallback destinations.
+- Persist per-channel send intent and acknowledgement across crashes. Hold uncertain outcomes instead of automatically resending, and expose `monitor delivery status` / `resolve ID CHANNEL delivered|not-delivered|abandon`; resolution commands never send messages.
+- Preserve corrupt watchlist, monitor-state and delivery files for inspection instead of resetting history. Guard cooldown updates against stale concurrent snapshots; distinguish first initialization from missing previously initialized state.
 - Apply the published 2026 exchange holiday calendar and exact session cutoffs to default monitoring. Label the closing auction correctly, pause on unverified calendar years, and keep status, diagnosis and next-open guidance consistent.
 - Keep report dates, scope, source evidence and missing-data warnings consistent. Do not present live quotes as historical reports or count duplicate leaderboard rows as additional money flows.
 - Validate backtest bars and conditions, normalize volume units, calculate requested moving-average windows, disclose conservative execution assumptions and retain the previous saved strategy when a run fails.

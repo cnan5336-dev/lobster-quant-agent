@@ -100,17 +100,19 @@ class MonitorReliabilityTests(unittest.TestCase):
         self.assertEqual(stock.build_strategy_alerts_once()["alerts_count"], 0)
 
     def test_false_then_true_obeys_cooldown_then_rearms(self):
-        first = stock.build_strategy_alerts_once()
-        stock._commit_alert_cooldowns(first["alerts"])
-        self.price = 2
-        self.assertEqual(stock.build_strategy_alerts_once()["alerts_count"], 0)
-        self.price = 4
-        self.assertEqual(stock.build_strategy_alerts_once()["alerts_count"], 0)
-        stock._commit_alert_cooldowns(first["alerts"], sent_at=time.time() - 120)
-        self.price = 2
-        stock.build_strategy_alerts_once()
-        self.price = 4
-        self.assertEqual(stock.build_strategy_alerts_once()["alerts_count"], 1)
+        with mock.patch.object(stock.time, "time", return_value=1000.0) as clock:
+            first = stock.build_strategy_alerts_once()
+            stock._commit_alert_cooldowns(first["alerts"])
+            self.price = 2
+            self.assertEqual(stock.build_strategy_alerts_once()["alerts_count"], 0)
+            self.price = 4
+            self.assertEqual(stock.build_strategy_alerts_once()["alerts_count"], 0)
+            # Let the clock advance; old ACK replay must never move cooldown back.
+            clock.return_value = 1120.0
+            self.price = 2
+            stock.build_strategy_alerts_once()
+            self.price = 4
+            self.assertEqual(stock.build_strategy_alerts_once()["alerts_count"], 1)
 
     def test_stale_and_missing_time_quotes_never_trigger(self):
         for stamp in (None, "2026-06-05 15:00:00", "2026-06-08 10:05:00", "bad"):
@@ -217,11 +219,22 @@ class MonitorReliabilityTests(unittest.TestCase):
 
     def test_delivery_only_commits_the_displayed_batch(self):
         alerts = [{"code": str(i), "message": "synthetic", "_cooldown_key": str(i)} for i in range(11)]
+        self.config["monitor"]["notify_channels"] = ["telegram"]
+        self.assertTrue(stock.save_monitor_state(stock.load_monitor_state()))
+        revision = stock.load_monitor_state()["revision"]
         def finish(*args):
             self.config["monitor"]["enabled"] = False
-        with mock.patch.object(stock, "build_monitor_alerts_once", return_value={"alerts_count": 11, "alerts": alerts}), mock.patch.object(stock, "send_monitor_notification", return_value={"ok": True}), mock.patch.object(stock, "_commit_alert_cooldowns", return_value=True) as commit, mock.patch.object(stock, "_monitor_wait", side_effect=finish), contextlib.redirect_stdout(io.StringIO()):
+        scan = {"ok": True, "alerts_count": 11, "alerts": alerts, "state_revision": revision}
+        delivered = {"ok": True, "channel": "telegram", "delivery_status": "delivered"}
+        with mock.patch.object(stock, "build_monitor_alerts_once", return_value=scan), mock.patch.object(stock, "send_monitor_notification", wraps=self.real_send_function), mock.patch.object(stock, "_send_monitor_notification_channel", return_value=delivered) as transport, mock.patch.object(stock, "_commit_alert_cooldowns", wraps=stock._commit_alert_cooldowns) as commit, mock.patch.object(stock, "_monitor_wait", side_effect=finish), contextlib.redirect_stdout(io.StringIO()):
             stock.monitor_loop()
+        transport.assert_called_once()
+        commit.assert_called_once()
         self.assertEqual(len(commit.call_args.args[0]), 10)
+        self.assertEqual(set(stock.load_monitor_state()["last_alerts"]), {str(i) for i in range(10)})
+        journal = json.loads(Path(stock.MONITOR_STATE_PATH + ".delivery.json").read_text())
+        self.assertEqual(len(journal["transactions"][0]["alerts"]), 10)
+        self.assertEqual(journal["transactions"][0]["state"], "complete")
 
     def test_state_save_failure_is_exposed_in_both_modes(self):
         for mode in ("normal", "strategy"):
@@ -238,6 +251,7 @@ class MonitorReliabilityTests(unittest.TestCase):
         self.assertIn("monitor_scan_not_committed", output.getvalue())
 
     def test_delivery_ack_failure_retries_save_without_resending(self):
+        self.config["monitor"]["notify_channels"] = ["telegram"]
         real_commit = stock._commit_alert_cooldowns
         commit_attempts = 0
         waits = 0
@@ -248,20 +262,27 @@ class MonitorReliabilityTests(unittest.TestCase):
         def wait(seconds, mode):
             nonlocal waits
             waits += 1
-            if waits <= 2:
+            if waits == 2:
                 self.assertGreaterEqual(seconds, 5)
+            if waits > 3:
+                raise AssertionError("bounded recovery did not complete")
             if waits == 3:
                 self.config["monitor"]["enabled"] = False
-        with mock.patch.object(stock, "_commit_alert_cooldowns", side_effect=commit), mock.patch.object(stock, "send_monitor_notification", return_value={"ok": True}) as send, mock.patch.object(stock, "_monitor_wait", side_effect=wait), contextlib.redirect_stdout(io.StringIO()) as output:
+        delivered = {"ok": True, "channel": "telegram", "delivery_status": "delivered"}
+        with mock.patch.object(stock, "_commit_alert_cooldowns", side_effect=commit), mock.patch.object(stock, "send_monitor_notification", wraps=self.real_send_function) as send, mock.patch.object(stock, "_send_monitor_notification_channel", return_value=delivered) as transport, mock.patch.object(stock, "_monitor_wait", side_effect=wait), contextlib.redirect_stdout(io.StringIO()) as output:
             stock.monitor_loop()
         self.assertEqual(commit_attempts, 3)
         self.assertEqual(send.call_count, 1)
-        self.assertIn("monitor_delivery_uncommitted", output.getvalue())
-        self.assertIn("monitor_delivery_commit_pending", output.getvalue())
+        transport.assert_called_once()
+        self.assertIn("monitor_delivery_blocked", output.getvalue())
+        self.assertIn("delivery_cooldown_pending", output.getvalue())
         self.assertTrue(stock.load_monitor_state()["last_alerts"])
+        journal = json.loads(Path(stock.MONITOR_STATE_PATH + ".delivery.json").read_text())
+        self.assertEqual(journal["transactions"][0]["state"], "complete")
+        self.assertEqual(journal["transactions"][0]["channels"][0]["status"], "delivered")
 
     def test_partial_channel_success_is_explicit_in_diagnose(self):
-        with mock.patch.object(stock, "send_openclaw_message", side_effect=lambda channel, text: {"ok": channel == "telegram", "channel": channel}):
+        with mock.patch.object(stock, "send_openclaw_message", side_effect=lambda channel, text: {"ok": channel == "telegram", "channel": channel, "delivery_status": "delivered" if channel == "telegram" else "not_sent"}):
             delivery = self.real_send_function("synthetic", channels=["weixin", "telegram"])
         self.assertTrue(delivery["ok"])
         self.assertTrue(delivery["partial"])

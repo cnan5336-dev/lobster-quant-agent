@@ -16,6 +16,16 @@ REPO = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("privacy_audit_under_test", REPO / "scripts/privacy_audit.py")
 privacy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(privacy)
+RUNTIME_PATHS = (
+    ".monitor-state-synthetic.tmp",
+    "market_monitor_state.json.initialized", "market_monitor_state.json.tmp.synthetic",
+    "market_monitor_state.json.delivery.json", "market_monitor_state.json.delivery.json.lock",
+    "market_monitor_state.json.delivery.json.initialized", "market_monitor_state.json.delivery.json.tmp.synthetic",
+    "custom_state.json.delivery.json", "custom_state.json.delivery.json.initialized",
+    "custom_state.json.delivery.json.tmp.synthetic", "custom_state.json.initialized",
+    "custom_state.json.initialized.tmp.synthetic",
+    "copied_state.json.delivery.json/item.txt", "copied_state.json.initialized/item.txt",
+)
 PRIVATE_PATHS = (
     "client-key", "client-key.backup", ".client-key.tmp-fixture", "client_key",
     "cliproxy-private/value", "openclaw.json", "openclaw.json5",
@@ -24,7 +34,7 @@ PRIVATE_PATHS = (
     "model_traffic_policy.json", "cliproxy-switch-policy.json", ".cliproxy-switch-installed.json",
     "market_watchlist.json", "market_monitor_state.json", "backtest_config.json", "openclaw-workspace-state.json",
     "request-logs/item.txt", "runtime-state/item.txt", "session-state/item.txt", "auth-state/item.txt",
-)
+) + RUNTIME_PATHS
 
 
 class PrivacyAuditTests(unittest.TestCase):
@@ -65,6 +75,18 @@ class PrivacyAuditTests(unittest.TestCase):
     def test_private_directory_alias_used_as_plain_file_is_rejected(self):
         self.write("cliproxy-private", "invented content")
         self.assert_private(privacy.audit(self.root), "cliproxy-private")
+
+    def test_delivery_artifacts_are_rejected_at_root_and_package_depths(self):
+        paths = []
+        for folder in ("", "python", "python/lobster_quant_agent", "scripts", "scripts/nested"):
+            for name in RUNTIME_PATHS:
+                path = str(Path(folder) / name)
+                self.write(path, "invented content")
+                paths.append(path)
+        findings = privacy.audit(self.root)
+        for path in paths:
+            with self.subTest(path=path):
+                self.assert_private(findings, path)
 
     def test_shell_credentials_quoted_and_unquoted_are_detected(self):
         for key in ("API_KEY", "DEEPSEEK_API_KEY", "ACCESS_TOKEN", "CLIENT_SECRET", "PASSWORD"):
@@ -155,6 +177,15 @@ class PrivacyAuditTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.root), "add", "-f", "node_modules/tracked.txt"], check=True, capture_output=True)
         self.assert_private(privacy.audit(self.root), "node_modules/tracked.txt")
 
+    @unittest.skipUnless(shutil.which("git"), "Git is needed for tracked-file regression")
+    def test_force_tracked_delivery_artifact_is_not_hidden_by_ignore_rules(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
+        shutil.copyfile(REPO / ".gitignore", self.root / ".gitignore")
+        name = "python/market_monitor_state.json.delivery.json"
+        self.write(name, "invented content")
+        subprocess.run(["git", "-C", str(self.root), "add", "-f", name], check=True, capture_output=True)
+        self.assert_private(privacy.audit(self.root), name)
+
     @unittest.skipUnless(shutil.which("git"), "Git is needed for ignore-rule regression")
     def test_git_ignore_covers_new_private_aliases(self):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
@@ -208,6 +239,21 @@ class PackagePrivacyTests(unittest.TestCase):
             self.assertNotIn(folder + "/cliproxy-private", names)
             for name in PRIVATE_PATHS:
                 self.assertNotIn(folder + "/nested/" + name, names)
+
+    def test_actual_npm_excludes_delivery_artifacts_at_package_depths(self):
+        paths = []
+        for folder in ("", "python", "python/lobster_quant_agent", "scripts", "scripts/nested"):
+            for name in RUNTIME_PATHS:
+                path = self.root / folder / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("invented content")
+                paths.append(path.relative_to(self.root).as_posix())
+        (self.root / "python/public.py").write_text("# public fixture\n")
+        result = subprocess.run([shutil.which("npm"), "pack", "--dry-run", "--json", "--ignore-scripts", "--offline"], cwd=self.root, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, "isolated npm pack failed")
+        names = {row["path"] for row in json.loads(result.stdout)[0]["files"]}
+        self.assertIn("python/public.py", names)
+        self.assertFalse(set(paths) & names, sorted(set(paths) & names))
 
     def run_checker(self, paths=None, malformed=False):
         shutil.copyfile(REPO / "scripts/check-package.mjs", self.root / "scripts/check-package.mjs")
