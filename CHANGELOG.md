@@ -16,6 +16,8 @@ All notable changes are recorded here. Versions follow Semantic Versioning.
 - Inherit the configured OpenClaw default model for explicit model helpers, use context-free inference, and share one timeout budget across attempts. Preserve plugin arguments and make cancellation/timeouts explicit.
 - Preserve private channel, notification, interpreter and state settings when the source installer is run again.
 - Update the development-only Vitest runner to patched 4.1.11 for GHSA-82fw-gwwq-j7x9; runtime dependencies are unchanged.
+- Keep provider error text out of request identifiers, notification results and diagnostic logs. Use fixed error summaries and minimal delivery acknowledgements; reject unsafe log files without changing existing permissions.
+- Detect private credential/state filenames and quoted credential assignments during publication checks, including tracked files inside excluded folders and readable secrets in binary or Unicode text. Reject symlinks and verify package exclusions with synthetic negative cases.
 
 ### Validation and boundaries
 

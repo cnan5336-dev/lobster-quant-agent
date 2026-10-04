@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import math
 import shlex
+import stat
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -1585,12 +1586,9 @@ def _classify_model_error(text):
 
 
 def _model_request_id(text):
-    matches = re.findall(
-        r"(?:request[\s_-]*id\s*[:：]\s*|\b)([A-Za-z0-9:_-]{12,})",
-        str(text or ""),
-        re.IGNORECASE
-    )
-    return matches[-1] if matches else None
+    # No independently trusted structured request-id field is exposed here.
+    # Error text may contain credentials, even when labelled as a request id.
+    return None
 
 
 def _model_error_summary(error_type):
@@ -1764,19 +1762,60 @@ def _run_model_once(model, prompt="只回复pong", timeout_seconds=45, route=Non
             "latency_seconds": latency,
             "error_type": "empty_response" if "empty" in str(exc).lower() else "json_parse_error",
             "request_id": _model_request_id(combined),
-            "provider_summary": f"模型返回无法解析：{str(exc)[:120]}"
+            "provider_summary": "模型返回格式无效或为空"
         }
 
 
 def _write_model_fallback_log(event):
+    folder_fd = file_fd = None
     try:
-        os.makedirs(os.path.dirname(MODEL_FALLBACK_LOG_PATH), exist_ok=True)
-        row = dict(event)
+        folder = os.path.dirname(MODEL_FALLBACK_LOG_PATH)
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        folder_fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if os.fstat(folder_fd).st_uid != os.geteuid():
+            return
+        name = os.path.basename(MODEL_FALLBACK_LOG_PATH)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
+        previous = None
+        try:
+            file_fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=folder_fd)
+            created = True
+        except FileExistsError:
+            previous = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(previous.st_mode) or previous.st_uid != os.geteuid()
+                    or previous.st_nlink != 1 or stat.S_IMODE(previous.st_mode) & ~0o600
+                    or not previous.st_mode & 0o200):
+                return
+            file_fd = os.open(name, flags, dir_fd=folder_fd)
+            created = False
+        info = os.fstat(file_fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1):
+            return
+        if previous is not None and ((previous.st_dev, previous.st_ino) != (info.st_dev, info.st_ino)
+                or stat.S_IMODE(info.st_mode) & ~0o600 or not info.st_mode & 0o200):
+            return
+        if created:
+            # Apply exact permissions only to the new file, even under a strict
+            # umask. Existing logs are never chmod'ed, read, truncated or moved.
+            os.fchmod(file_fd, 0o600)
+        # Never persist raw provider text, prompts, credentials or extracted ids.
+        row = {key: event[key] for key in ("event", "primary_model", "fallback_model", "error_type")
+               if key in event}
         row["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(MODEL_FALLBACK_LOG_PATH, "a", encoding="utf-8") as handle:
+        with os.fdopen(file_fd, "a", encoding="utf-8") as handle:
+            file_fd = None
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:
+        # Logging must not expose OS errors or change model routing behavior.
         pass
+    finally:
+        for descriptor in (file_fd, folder_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def model_call_with_fallback(prompt, timeout_seconds=90):
@@ -5766,11 +5805,28 @@ def build_monitor_alerts_once():
 
 
 def _safe_error_summary(error):
-    text = str(error or "")
-    text = re.sub(r"bot[0-9A-Za-z:_-]+", "bot***", text)
-    text = re.sub(r"Bearer\s+[0-9A-Za-z._-]+", "Bearer ***", text, flags=re.I)
-    text = re.sub(r"token[=:]\s*[^\\s,]+", "token=***", text, flags=re.I)
-    return text[:240] if text else ""
+    # Provider errors can contain arbitrary credentials. Return authored
+    # categories only, rather than attempting to redact individual tokens.
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "通知发送超时；请稍后检查通道状态。"
+    try:
+        text = str(error or "").lower()
+    except Exception:
+        text = ""
+    categories = (
+        (("401", "403", "unauthorized", "forbidden", "authentication", "invalid api key"),
+         "通知通道认证或权限检查未通过；请检查本机通道配置。"),
+        (("429", "rate limit", "too many requests"), "通知通道触发限流；请稍后重试。"),
+        (("timeout", "timed out", "超时"), "通知发送超时；请稍后检查通道状态。"),
+        (("connection refused", "connection reset", "network unreachable", "enotfound", "econnrefused"),
+         "通知通道连接失败；请检查服务和网络状态。"),
+    )
+    for needles, summary in categories:
+        if any(needle in text for needle in needles):
+            return summary
+    if isinstance(error, OSError):
+        return "通知通道或本机执行失败；请检查通道配置、服务和本机状态。"
+    return "通知发送失败；请检查通道配置和服务状态。"
 
 
 def _notification_targets():
@@ -5819,13 +5875,6 @@ def send_openclaw_message(channel, text):
             text=True,
             timeout=25,
         )
-        raw = (proc.stdout or "").strip()
-        payload = {}
-        if raw:
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                payload = {"raw": raw[:500]}
         if proc.returncode != 0:
             return {
                 "ok": False,
@@ -5833,12 +5882,29 @@ def send_openclaw_message(channel, text):
                 "error": _safe_error_summary(proc.stderr or proc.stdout),
                 "returncode": proc.returncode,
             }
+        try:
+            payload = json.loads(proc.stdout or "")
+        except (ValueError, TypeError):
+            return {"ok": False, "channel": normalized,
+                    "error": "通知返回格式无效；无法确认发送结果。"}
+        if not isinstance(payload, dict):
+            return {"ok": False, "channel": normalized,
+                    "error": "通知返回格式无效；无法确认发送结果。"}
+        confirmations = [payload]
+        if isinstance(payload.get("payload"), dict):
+            confirmations.append(payload["payload"])
+        if any(item.get("ok") is False or item.get("success") is False or item.get("error")
+               for item in confirmations):
+            return {"ok": False, "channel": normalized,
+                    "error": "通知服务未确认发送成功；请检查通道状态。"}
         return {
             "ok": True,
             "channel": normalized,
             "provider_channel": provider_channel,
             "target_masked": str(delivery["target"])[:4] + "***",
-            "response": payload,
+            # Keep a local confirmation only; provider bodies can contain
+            # credentials or diagnostic text even when the command succeeds.
+            "response": {"ok": True},
         }
     except Exception as exc:
         return {"ok": False, "channel": normalized, "error": _safe_error_summary(exc)}

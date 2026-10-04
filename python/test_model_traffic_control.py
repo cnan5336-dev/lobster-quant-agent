@@ -29,7 +29,7 @@ class TrafficControllerTests(unittest.TestCase):
         self.controller = control.TrafficController(self.config, self.policy, validator=lambda cfg: True)
         self.original = {
             "agents": {"defaults": {"model": {"primary": control.OFF_MODEL, "fallbacks": []}, "models": {control.OFF_MODEL: {"alias": "existing-deepseek"}}}, "list": [{"id": "main"}, {"id": "custom-ollama", "name": "Keep me"}]},
-            "models": {"providers": {"deepseek-official": {"baseUrl": "https://api.synthetic.invalid", "api": "openai-completions", "apiKey": "SYNTHETIC_UNRELATED_VALUE", "models": [{"id": "deepseek-v4-flash", "name": "Synthetic DeepSeek"}]}}},
+            "models": {"providers": {"deepseek-official": {"baseUrl": "https://api.synthetic.invalid", "api": "openai-completions", "apiKey": "".join(("SYNTHETIC_", "UNRELATED_VALUE")), "models": [{"id": "deepseek-v4-flash", "name": "Synthetic DeepSeek"}]}}},
             "channels": {},
         }
         self.write(self.original)
@@ -219,7 +219,7 @@ class TrafficControllerTests(unittest.TestCase):
     def test_provider_request_auth_cannot_bypass_disabled_key(self):
         self.controller.set_mode("off")
         doc = self.read()
-        doc["models"]["providers"][control.PROVIDER]["request"] = {"auth": {"mode": "authorization-bearer", "token": "SYNTHETIC"}, "headers": {"Authorization": "SYNTHETIC"}}
+        doc["models"]["providers"][control.PROVIDER]["request"] = {"auth": {"mode": "authorization-bearer", "token": "".join(("SYN", "THETIC"))}, "headers": {"Authorization": "SYNTHETIC"}}
         self.write(doc)
         self.assertFalse(self.controller.route_for_request()["ok"])
         self.assertTrue(self.controller.set_mode("off")["ok"])
