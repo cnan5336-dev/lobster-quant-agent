@@ -11,6 +11,8 @@ python3 scripts/prepare-cliproxy-key.py
 
 输入程序只接受用户手动输入的新客户端密钥，不读取现有代理配置，也不会启动请求或开启开关。完成兼容性检查后，再按需开启。
 
+如果代理返回客户端鉴权错误，需要重录已有输入时，明确使用 `python3 scripts/prepare-cliproxy-key.py --replace`。它仍要求真实终端和两次隐藏输入；不会读取旧密钥，确认原文件未被其他操作改变后才原子替换。应输入 CLIProxyAPI 的客户端 API key，而非 OAuth token、管理密码或 DeepSeek 密钥。该命令不会重置代理服务的密钥，也不会影响其他客户端。
+
 ```bash
 python3 python/lobster_quant_agent/cli.py model codex status
 python3 python/lobster_quant_agent/cli.py model codex on
