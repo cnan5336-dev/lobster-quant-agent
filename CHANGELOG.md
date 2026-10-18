@@ -4,6 +4,10 @@ All notable changes are recorded here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+### Added
+
+- Opt-in explicit retrieval gate with durable usage reservations, task/month limits, evidence-preserving cache reuse, and offline-only adapter tests. No network transport or production routing is enabled.
+
 ### Fixed
 
 - Preserve every supported strategy condition, comparison, direction, timeframe and explicit symbol; reject ambiguous combinations instead of silently changing their meaning. Return a readable execution preview and keep the previous strategy when parsing fails.

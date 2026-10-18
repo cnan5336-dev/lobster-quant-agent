@@ -55,7 +55,8 @@
     "DISCLAIMER.md",
     "docs/demo",
     "docs/model-traffic-switch.md",
-    "LICENSE"
+    "LICENSE",
+    "docs/retrieval-controls.md"
   ],
   "engines": {
     "node": ">=22.22.3"

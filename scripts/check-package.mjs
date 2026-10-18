@@ -30,6 +30,8 @@ const required = [
   "python/lobster_quant_agent/model_traffic_adapter.py",
   "scripts/prepare-cliproxy-key.py",
   "docs/model-traffic-switch.md",
+  "docs/retrieval-controls.md",
+  "python/lobster_quant_agent/retrieval_control.py",
   "scripts/install.sh",
   "scripts/check-versions.mjs",
   "scripts/run-openclaw-isolated.mjs",
