@@ -222,3 +222,5 @@ Maintainers should also follow [MAINTAINERS.md](MAINTAINERS.md) and the [local C
 - Never commit local OpenClaw configuration, credentials, channel/account identifiers, notification targets, watchlists, holdings, state, caches, logs, screenshots, or generated results.
 
 See [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [DISCLAIMER.md](DISCLAIMER.md). Licensed under the [MIT License](LICENSE).
+
+显式检索的离线控制层、调用计量、共享缓存、任务/月限额和 ATI 接入边界见[检索控制说明](docs/retrieval-controls.md)。该模块不启用联网检索，不会自动接管主 Agent 的工具。

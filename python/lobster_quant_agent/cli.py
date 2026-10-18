@@ -7948,6 +7948,16 @@ def main():
                     print_json(backtest_run_saved_command(symbol, **options))
             else:
                 print_json({"error": f"未知回测操作：{action}"})
+        elif cmd == "retrieval":
+            from retrieval_control import RetrievalGate
+            if len(sys.argv) != 4 or sys.argv[2] != "status":
+                print_json({"error": "usage: retrieval status TASK_ID"})
+            else:
+                directory = Path(_state_path("retrieval"))
+                if not directory.exists():
+                    print_json({"initialized": False, "transport_enabled": False})
+                else:
+                    print_json(RetrievalGate(directory).status(task_id=sys.argv[3]))
         elif cmd == "model":
             print_json(_dispatch_model_command(sys.argv[2:]))
         elif cmd in {"monitor_once", "盯盘一次"}:
